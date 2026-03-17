@@ -53,6 +53,12 @@ void WsServer::stop() {
     beast::error_code ec;
     acceptor_.close(ec);
 
+    // Purge dead entries before iterating
+    sessions_.erase(
+        std::remove_if(sessions_.begin(), sessions_.end(),
+                       [](const std::weak_ptr<WsSession> &w) { return w.expired(); }),
+        sessions_.end());
+
     for (auto &wptr : sessions_) {
         if (auto sp = wptr.lock())
             sp->close();
@@ -84,6 +90,13 @@ void WsServer::on_accept_(beast::error_code ec, tcp::socket socket) {
         std::remove_if(sessions_.begin(), sessions_.end(),
                        [](const std::weak_ptr<WsSession> &w) { return w.expired(); }),
         sessions_.end());
+
+    constexpr std::size_t kMaxSessions = 10;
+    if (sessions_.size() >= kMaxSessions) {
+        std::cerr << "[WsServer] connection limit reached (" << kMaxSessions << "), dropping new client\n";
+        do_accept_();
+        return;
+    }
 
     auto session = WsSession::create(std::move(socket), ssl_ctx_, on_message_);
     sessions_.emplace_back(session);
@@ -150,6 +163,7 @@ void WsSession::do_ws_accept_() {
         [self = shared_from_this()](beast::error_code ec) {
             if (ec) { self->fail_(ec, "ws_accept"); return; }
             std::cerr << "[WsServer] client connected addr=" << self->remote_addr_ << "\n";
+            self->ws_.read_message_max(4 * 1024 * 1024); // 4 MB hard limit per frame
             self->do_read_();
         }
     );

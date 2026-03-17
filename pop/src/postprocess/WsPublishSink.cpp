@@ -146,6 +146,21 @@ namespace md {
         }
     }
 
+    void WsPublishSink::publish_status(std::string_view feed_state, std::string_view reason) noexcept {
+        if (!running_) return;
+        try {
+            nlohmann::json j;
+            j["schema_version"] = 1;
+            j["event_type"]     = "status";
+            j["venue"]          = venue_;
+            j["symbol"]         = symbol_;
+            j["feed_state"]     = feed_state;
+            j["reason"]         = reason;
+            j["ts_ns"]          = now_ns_();
+            send_json_(j);
+        } catch (...) {}
+    }
+
     void WsPublishSink::publish_snapshot(const GenericSnapshotFormat &snap, std::string_view source) noexcept {
         if (!running_) return;
         nlohmann::json j;

@@ -102,6 +102,7 @@ int main(int argc, char **argv) {
     cfg.persist_path = options.persist_path.value_or("");
     cfg.persist_book_every_updates = static_cast<std::size_t>(options.persist_book_every_updates);
     cfg.persist_book_top = static_cast<std::size_t>(options.persist_book_top);
+    cfg.rest_timeout_ms = options.rest_timeout_ms;
 
     // Brain WS defaults (only when enabled).
     if (!cfg.brain_ws_host.empty()) {

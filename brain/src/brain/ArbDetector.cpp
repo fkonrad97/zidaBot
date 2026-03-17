@@ -72,13 +72,18 @@ std::vector<ArbCross> ArbDetector::scan(const std::vector<VenueBook> &venues) {
             // Cross condition: sell_bid > buy_ask
             if (sell_bid_tick <= buy_ask_tick) continue;
 
-            // Staleness guard
+            // Individual book age guard — catches two books both stale by the same amount
+            if (max_age_diff_ns_ > 0 && (ts_now - sv.ts_book_ns) > max_age_diff_ns_) continue;
+            if (max_age_diff_ns_ > 0 && (ts_now - bv.ts_book_ns) > max_age_diff_ns_) continue;
+
+            // Relative staleness guard — catches books that diverged in time
             const std::int64_t age_diff = std::abs(sv.ts_book_ns - bv.ts_book_ns);
             if (max_age_diff_ns_ > 0 && age_diff > max_age_diff_ns_) continue;
 
             // Spread in bps (priceTick units are price × 100; ratio is dimensionless)
             const double spread_abs = static_cast<double>(sell_bid_tick - buy_ask_tick);
             const double mid        = static_cast<double>(sell_bid_tick + buy_ask_tick) * 0.5;
+            if (mid <= 0.0) continue; // guard against degenerate ticks
             const double spread_bps = (spread_abs / mid) * 10000.0;
 
             if (spread_bps < min_spread_bps_) continue;

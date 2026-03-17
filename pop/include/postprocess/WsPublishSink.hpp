@@ -53,6 +53,11 @@ namespace md {
         void start();
         void stop();
 
+        /// Publish a feed health status event to brain.
+        /// feed_state: "disconnected" | "resyncing" | "synced"
+        /// Called automatically by GenericFeedHandler on every sync state transition.
+        void publish_status(std::string_view feed_state, std::string_view reason) noexcept;
+
         void publish_snapshot(const GenericSnapshotFormat &snap, std::string_view source) noexcept;
         void publish_incremental(const GenericIncrementalFormat &inc, std::string_view source) noexcept;
         void publish_book_state(const OrderBook &book,

@@ -2,8 +2,8 @@
 
 #include <vector>
 #include <algorithm>
-#include <cassert>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 
 struct Level {
@@ -33,7 +33,8 @@ namespace md {
     class OrderBook {
     public:
         explicit OrderBook(std::size_t depth) : depth(depth) {
-            assert(depth > 0 && "Order Book depth must be greater than 0!");
+            if (depth == 0)
+                throw std::invalid_argument("OrderBook: depth must be greater than 0");
 
             /// For both vector, (depth + 1) space alocated. The plus 1 is needed to not have any reallocation,
             /// when the update of the Order Book exceeds the depth by 1 if it full and we have an update to it.

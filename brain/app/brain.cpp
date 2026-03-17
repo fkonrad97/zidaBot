@@ -8,6 +8,7 @@
 #include <boost/asio/ssl/context.hpp>
 
 #include <nlohmann/json.hpp>
+#include <openssl/ssl.h>
 
 #include "brain/ArbDetector.hpp"
 #include "brain/BrainCmdLine.hpp"
@@ -24,6 +25,17 @@ int main(int argc, char **argv) {
     try {
         ssl_ctx.use_certificate_chain_file(opts.certfile);
         ssl_ctx.use_private_key_file(opts.keyfile, boost::asio::ssl::context::pem);
+        ssl_ctx.set_options(
+            boost::asio::ssl::context::default_workarounds |
+            boost::asio::ssl::context::no_sslv2 |
+            boost::asio::ssl::context::no_sslv3 |
+            boost::asio::ssl::context::no_tlsv1 |
+            boost::asio::ssl::context::no_tlsv1_1
+        );
+        SSL_CTX_set_cipher_list(ssl_ctx.native_handle(),
+            "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
+            "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:"
+            "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256");
     } catch (const std::exception &e) {
         std::cerr << "[brain] TLS setup error: " << e.what() << "\n";
         return 1;
@@ -36,7 +48,7 @@ int main(int argc, char **argv) {
     brain::UnifiedBook book(opts.depth);
     brain::ArbDetector arb(
         opts.min_spread_bps,
-        static_cast<std::int64_t>(opts.max_age_ms) * 1'000'000LL,
+        opts.max_age_ms * 1'000'000LL,
         opts.output
     );
 
@@ -63,6 +75,7 @@ int main(int argc, char **argv) {
     boost::asio::signal_set signals(ioc, SIGINT, SIGTERM);
     signals.async_wait([&](const boost::system::error_code &, int) {
         std::cerr << "[brain] shutting down\n";
+        arb.flush();
         server.stop();
         ioc.stop();
     });

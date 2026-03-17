@@ -6,9 +6,8 @@
 #include <boost/beast/version.hpp>
 #include <boost/asio/ssl/error.hpp>
 
-#include <openssl/err.h>
+#include <boost/asio/ssl/rfc2818_verification.hpp>
 #include <openssl/ssl.h>
-#include <openssl/x509v3.h> // X509_check_host
 
 namespace md {
     using tcp = boost::asio::ip::tcp;
@@ -24,6 +23,24 @@ namespace md {
           resolver_(ioc_),
           connect_deadline_(ioc_),
           ping_timer_(ioc_) {
+        // Disable legacy protocols; require TLS 1.2+.
+        ssl_ctx_.set_options(
+            ssl::context::default_workarounds |
+            ssl::context::no_sslv2 |
+            ssl::context::no_sslv3 |
+            ssl::context::no_tlsv1 |
+            ssl::context::no_tlsv1_1
+        );
+        // Restrict to modern AEAD cipher suites (TLS 1.2 compatible).
+        // TLS 1.3 cipher suites are managed separately by OpenSSL and are
+        // always strong, so no explicit TLS 1.3 filter is required.
+        SSL_CTX_set_cipher_list(ssl_ctx_.native_handle(),
+            "ECDHE-ECDSA-AES256-GCM-SHA384:"
+            "ECDHE-RSA-AES256-GCM-SHA384:"
+            "ECDHE-ECDSA-CHACHA20-POLY1305:"
+            "ECDHE-RSA-CHACHA20-POLY1305:"
+            "ECDHE-ECDSA-AES128-GCM-SHA256:"
+            "ECDHE-RSA-AES128-GCM-SHA256");
         ssl_ctx_.set_default_verify_paths();
         ssl_ctx_.set_verify_mode(ssl::verify_peer);
 
@@ -76,25 +93,9 @@ namespace md {
 
                                   // Configure hostname verification for this host
                                   if (self->tls_verify_peer_) {
-                                      const std::string host_for_verify = self->host_;
                                       self->ws_.next_layer().set_verify_mode(ssl::verify_peer);
                                       self->ws_.next_layer().set_verify_callback(
-                                          [host_for_verify](bool preverified, ssl::verify_context &ctx) {
-                                              if (!preverified) return false;
-
-                                              X509_STORE_CTX *sctx = ctx.native_handle();
-                                              if (X509_STORE_CTX_get_error_depth(sctx) != 0) return true;
-
-                                              X509 *cert = X509_STORE_CTX_get_current_cert(sctx);
-                                              if (!cert) return false;
-
-                                              return X509_check_host(cert,
-                                                                     host_for_verify.c_str(),
-                                                                     host_for_verify.size(),
-                                                                     0,
-                                                                     nullptr) == 1;
-                                          }
-                                      );
+                                          ssl::rfc2818_verification(self->host_));
                                   } else {
                                       self->ws_.next_layer().set_verify_mode(ssl::verify_none);
                                   }

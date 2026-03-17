@@ -30,6 +30,9 @@ public:
     /// and optionally to the output JSONL file. Returns all detected crosses.
     std::vector<ArbCross> scan(const std::vector<VenueBook> &venues);
 
+    /// Flush the output file. Call before shutdown to prevent partial-line loss.
+    void flush() noexcept { if (output_.is_open()) output_.flush(); }
+
 private:
     static std::int64_t now_ns_() noexcept;
     void emit_(const ArbCross &cross);

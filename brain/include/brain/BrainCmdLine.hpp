@@ -14,7 +14,7 @@ struct BrainOptions {
     std::string keyfile;        ///< Required: TLS private key PEM
     std::string output;         ///< Optional: arb signal JSONL output file path
     double      min_spread_bps{0.0};
-    int         max_age_ms{5000};
+    std::int64_t max_age_ms{5000};
     std::size_t depth{50};      ///< OrderBook depth per venue
     bool        show_help{false};
 };
@@ -37,7 +37,7 @@ inline bool parse_brain_cmdline(int argc, char **argv, BrainOptions &out) {
                           "Arb signal output JSONL file path")
         ("min-spread-bps",po::value<double>()->default_value(0.0),
                           "Minimum spread in bps to emit (default 0 = all crosses)")
-        ("max-age-ms",    po::value<int>()->default_value(5000),
+        ("max-age-ms",    po::value<std::int64_t>()->default_value(5000),
                           "Max book age difference ms for cross-venue staleness guard")
         ("depth",         po::value<std::size_t>()->default_value(50),
                           "OrderBook depth per venue");
@@ -60,7 +60,7 @@ inline bool parse_brain_cmdline(int argc, char **argv, BrainOptions &out) {
     out.bind          = vm["bind"].as<std::string>();
     out.port          = vm["port"].as<uint16_t>();
     out.min_spread_bps = vm["min-spread-bps"].as<double>();
-    out.max_age_ms    = vm["max-age-ms"].as<int>();
+    out.max_age_ms    = vm["max-age-ms"].as<std::int64_t>();
     out.depth         = vm["depth"].as<std::size_t>();
     if (vm.count("certfile")) out.certfile = vm["certfile"].as<std::string>();
     if (vm.count("keyfile"))  out.keyfile  = vm["keyfile"].as<std::string>();

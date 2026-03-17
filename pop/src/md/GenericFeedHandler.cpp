@@ -19,11 +19,7 @@ namespace md
         rest_->set_keep_alive(true); // strongly recommended for snapshots
         rest_->set_logger([](std::string_view s)
                           {
-            // plug into your logging system; std::cerr is fine for now
             std::cerr << s << "\n"; });
-        // should be decreased for prod
-        rest_->set_timeout(std::chrono::milliseconds(8000));
-        rest_->set_shutdown_timeout(std::chrono::milliseconds(2000));
     }
 
     std::string GenericFeedHandler::makeConnectId() const
@@ -76,6 +72,16 @@ namespace md
         }
         std::cerr << "\n";
         state_ = next;
+
+        if (brain_publish_) {
+            std::string_view feed_state;
+            switch (next) {
+                case FeedSyncState::DISCONNECTED: feed_state = "disconnected"; break;
+                case FeedSyncState::SYNCED:       feed_state = "synced";       break;
+                default:                          feed_state = "resyncing";    break;
+            }
+            brain_publish_->publish_status(feed_state, reason);
+        }
     }
 
     GenericFeedHandler::AnyAdapter GenericFeedHandler::makeAdapter(VenueId v)
@@ -105,6 +111,9 @@ namespace md
             return FeedOpResult::ERROR;
 
         cfg_ = cfg;
+
+        rest_->set_timeout(std::chrono::milliseconds(cfg_.rest_timeout_ms));
+        rest_->set_shutdown_timeout(std::chrono::milliseconds(2000));
 
         adapter_ = makeAdapter(cfg.venue_name);
         rt_.caps = std::visit([&](auto const &a)

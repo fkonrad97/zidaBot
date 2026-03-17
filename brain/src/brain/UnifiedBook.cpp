@@ -8,8 +8,9 @@ namespace brain {
 // ---------------------------------------------------------------------------
 // VenueBook
 
-VenueBook::VenueBook(std::string name, std::size_t depth)
+VenueBook::VenueBook(std::string name, std::string sym, std::size_t depth)
     : venue_name(std::move(name)),
+      symbol(std::move(sym)),
       controller(std::make_unique<md::OrderBookController>(depth)) {
     // Brain joins mid-stream: allow sequence gaps on all controllers.
     // No checksum function: PoP has already validated.
@@ -17,7 +18,7 @@ VenueBook::VenueBook(std::string name, std::size_t depth)
 }
 
 bool VenueBook::synced() const noexcept {
-    return controller->isSynced();
+    return feed_healthy && controller->isSynced();
 }
 
 const md::OrderBook &VenueBook::book() const noexcept {
@@ -29,12 +30,12 @@ const md::OrderBook &VenueBook::book() const noexcept {
 
 UnifiedBook::UnifiedBook(std::size_t depth) : depth_(depth) {}
 
-VenueBook *UnifiedBook::find_or_create_(const std::string &venue) {
+VenueBook *UnifiedBook::find_or_create_(const std::string &venue, const std::string &symbol) {
     for (auto &vb : books_) {
-        if (vb.venue_name == venue) return &vb;
+        if (vb.venue_name == venue && vb.symbol == symbol) return &vb;
     }
-    books_.emplace_back(venue, depth_);
-    std::cerr << "[UnifiedBook] registered new venue: " << venue << "\n";
+    books_.emplace_back(venue, symbol, depth_);
+    std::cerr << "[UnifiedBook] registered new venue+symbol: " << venue << ":" << symbol << "\n";
     return &books_.back();
 }
 
@@ -55,12 +56,13 @@ std::string UnifiedBook::on_event(const nlohmann::json &j) {
 
     if (hdr.venue.empty() || hdr.event_type.empty()) return {};
 
-    VenueBook *vb = find_or_create_(hdr.venue);
+    VenueBook *vb = find_or_create_(hdr.venue, hdr.symbol);
 
     try {
         if (hdr.event_type == "snapshot") {
             auto snap = parse_snapshot(j);
-            vb->ts_book_ns = snap.ts_recv_ns;
+            vb->ts_book_ns   = snap.ts_recv_ns;
+            vb->feed_healthy = true;
             const auto action = vb->controller->onSnapshot(
                 snap, md::OrderBookController::BaselineKind::WsAuthoritative);
             if (action == md::OrderBookController::Action::NeedResync)
@@ -68,19 +70,40 @@ std::string UnifiedBook::on_event(const nlohmann::json &j) {
 
         } else if (hdr.event_type == "incremental") {
             auto inc = parse_incremental(j);
-            vb->ts_book_ns = inc.ts_recv_ns;
+            vb->ts_book_ns   = inc.ts_recv_ns;
+            vb->feed_healthy = true;
             const auto action = vb->controller->onIncrement(inc);
             if (action == md::OrderBookController::Action::NeedResync)
                 std::cerr << "[UnifiedBook] NeedResync after incremental venue=" << hdr.venue
                           << " — awaiting next book_state\n";
 
         } else if (hdr.event_type == "book_state") {
-            vb->ts_book_ns = extract_ts_book_ns(j);
+            vb->ts_book_ns   = extract_ts_book_ns(j);
+            vb->feed_healthy = true;
             auto snap = parse_book_state_as_snapshot(j);
             const auto action = vb->controller->onSnapshot(
                 snap, md::OrderBookController::BaselineKind::WsAuthoritative);
             if (action == md::OrderBookController::Action::NeedResync)
                 std::cerr << "[UnifiedBook] NeedResync after book_state venue=" << hdr.venue << "\n";
+
+        } else if (hdr.event_type == "status") {
+            const std::string feed_state = j.value("feed_state", "");
+            const std::string reason     = j.value("reason", "");
+            std::cerr << "[UnifiedBook] status venue=" << hdr.venue
+                      << " state=" << feed_state;
+            if (!reason.empty()) std::cerr << " reason=" << reason;
+            std::cerr << "\n";
+
+            if (feed_state == "disconnected") {
+                // PoP lost its exchange feed — book is stale; stop using it immediately.
+                vb->feed_healthy = false;
+                vb->controller->resetBook();
+                vb->ts_book_ns = 0;
+            } else {
+                // "resyncing" or any unknown transitional state: mark unhealthy until
+                // the next data event confirms the feed is live again.
+                vb->feed_healthy = false;
+            }
 
         } else {
             return {};

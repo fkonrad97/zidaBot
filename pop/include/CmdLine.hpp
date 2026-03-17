@@ -29,6 +29,7 @@ struct CmdOptions {
     std::optional<std::string> log_path; // optional process log file path
     int persist_book_every_updates{0}; // 0 = disabled
     int persist_book_top{50}; // top N levels per side
+    int rest_timeout_ms{8000}; // REST snapshot request timeout
 
     // Debug flags
     bool debug{false};
@@ -98,6 +99,8 @@ inline bool parse_cmdline(int argc, char **argv, CmdOptions &out) {
              "Persist orderbook checkpoint every N applied updates (0 disables)")
             ("persist_book_top", po::value<int>()->default_value(50),
              "Orderbook checkpoint top N levels per side")
+            ("rest_timeout_ms", po::value<int>()->default_value(8000),
+             "REST snapshot request timeout in milliseconds")
             ("debug", po::bool_switch()->default_value(false),
              "Enable debug logging (rate-limited)")
             ("debug_raw", po::bool_switch()->default_value(false),
@@ -158,6 +161,7 @@ inline bool parse_cmdline(int argc, char **argv, CmdOptions &out) {
     if (vm.count("log_path")) out.log_path = vm["log_path"].as<std::string>();
     out.persist_book_every_updates = std::max(0, vm["persist_book_every_updates"].as<int>());
     out.persist_book_top = std::max(1, vm["persist_book_top"].as<int>());
+    out.rest_timeout_ms = std::max(1000, vm["rest_timeout_ms"].as<int>());
 
     /// DEBUG
     out.debug = vm["debug"].as<bool>();

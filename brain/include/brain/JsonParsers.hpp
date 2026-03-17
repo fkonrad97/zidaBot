@@ -4,6 +4,7 @@
 // Field names must match exactly what WsPublishSink serializes.
 
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -24,6 +25,8 @@ struct EventHeader {
 inline EventHeader parse_header(const nlohmann::json &j) {
     EventHeader h;
     h.schema_version = j.value("schema_version", 0);
+    if (h.schema_version != 1)
+        throw std::runtime_error("unsupported schema_version: " + std::to_string(h.schema_version));
     h.event_type     = j.value("event_type", "");
     h.venue          = j.value("venue", "");
     h.symbol         = j.value("symbol", "");

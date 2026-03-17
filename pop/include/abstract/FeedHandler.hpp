@@ -62,6 +62,8 @@ namespace md {
         std::size_t persist_book_every_updates{0}; ///< 0 = disabled
         std::size_t persist_book_top{0}; ///< top N levels per side for book_state
 
+        int rest_timeout_ms{8000}; ///< REST snapshot request timeout in milliseconds
+
         size_t depthLevel{0};
     };
 
