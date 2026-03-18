@@ -64,6 +64,12 @@ namespace md {
 
         int rest_timeout_ms{8000}; ///< REST snapshot request timeout in milliseconds
 
+        /// C2: rate monitor ceiling (msgs/sec); WARN if measured rate > 2×ceiling; 0 = disabled.
+        int max_msg_rate_per_sec{0};
+
+        /// C3: call OrderBook::validate() every N applied updates; 0 = disabled.
+        int validate_every{0};
+
         size_t depthLevel{0};
     };
 

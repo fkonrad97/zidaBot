@@ -71,12 +71,14 @@ namespace md {
 
         const bool checksum_enabled = (checksum_fn_ != nullptr);
 
-        // If checksum is enabled, require it to be present and correct.
+        // If checksum is enabled and a checksum was actually provided, validate it.
+        // A snapshot with checksum==0 is accepted as best-effort (some venues don't
+        // include a checksum on the initial baseline but do include them on incrementals).
         if (checksum_enabled) {
             if (msg.checksum == 0) {
-                return need_resync_("snapshot_missing_checksum");
-            }
-            if (!validateChecksum(msg.checksum)) {
+                std::cerr << "[OrderBookController] snapshot has no checksum (best-effort baseline)\n";
+                // Continue without validation — first incremental checksum will verify.
+            } else if (!validateChecksum(msg.checksum)) {
                 return need_resync_("snapshot_checksum_mismatch");
             }
         }
@@ -148,6 +150,17 @@ namespace md {
                 set_state_(BookSyncState::Synced, "bridge_seqless_incremental_applied");
             }
 
+            // C1: crossed-book guard
+            {
+                const auto &bid = book_.best_bid();
+                const auto &ask = book_.best_ask();
+                if (bid.priceTick > 0 && ask.priceTick > 0 && bid.priceTick >= ask.priceTick) {
+                    std::cerr << "[OrderBookController] book_crossed after bridge"
+                              << " bid=" << bid.priceTick << " ask=" << ask.priceTick << "\n";
+                    return need_resync_("book_crossed_bridge", msg.first_seq, msg.last_seq, expected_seq_);
+                }
+            }
+
             if (checksum_enabled) {
                 if (msg.checksum == 0) {
                     std::cerr << "[CTRL][BRIDGE] RESYNC missing checksum while enabled\n";
@@ -188,6 +201,28 @@ namespace md {
         } else {
             // seq-less venue: checksum is the integrity guard
             applyIncrementUpdate(msg);
+        }
+
+        // C1: crossed-book guard — bid >= ask means data corruption; resync immediately
+        {
+            const auto &bid = book_.best_bid();
+            const auto &ask = book_.best_ask();
+            if (bid.priceTick > 0 && ask.priceTick > 0 && bid.priceTick >= ask.priceTick) {
+                std::cerr << "[OrderBookController] book_crossed after incremental"
+                          << " bid=" << bid.priceTick << " ask=" << ask.priceTick << "\n";
+                return need_resync_("book_crossed", msg.first_seq, msg.last_seq, expected_seq_);
+            }
+        }
+
+        // C3: periodic sort-order / uniqueness validation
+        if (validate_period_ > 0) {
+            if (++validate_counter_ >= validate_period_) {
+                validate_counter_ = 0;
+                if (!book_.validate()) {
+                    std::cerr << "[OrderBookController] validate() failed after incremental\n";
+                    return need_resync_("validate_failed", msg.first_seq, msg.last_seq, expected_seq_);
+                }
+            }
         }
 
         if (checksum_enabled) {

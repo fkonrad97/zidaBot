@@ -35,12 +35,25 @@ inline EventHeader parse_header(const nlohmann::json &j) {
 
 /// Parse a single level object. priceTick/quantityLot are already integers
 /// in the wire format (pre-computed by WsPublishSink); no conversion needed.
+/// Throws std::runtime_error on negative quantities or non-positive prices on
+/// non-removal levels (quantityLot > 0 requires priceTick > 0).
 inline Level parse_level(const nlohmann::json &lvl) {
     Level l;
     l.priceTick   = lvl.value("priceTick",   std::int64_t{0});
     l.quantityLot = lvl.value("quantityLot", std::int64_t{0});
     l.price       = lvl.value("price",    std::string{});
     l.quantity    = lvl.value("quantity", std::string{});
+
+    // Sanity: negative quantity is never valid
+    if (l.quantityLot < 0)
+        throw std::runtime_error("parse_level: negative quantityLot=" +
+                                 std::to_string(l.quantityLot));
+    // Sanity: a resting level (qty > 0) must have a positive price
+    if (l.quantityLot > 0 && l.priceTick <= 0)
+        throw std::runtime_error("parse_level: non-positive priceTick=" +
+                                 std::to_string(l.priceTick) +
+                                 " on resting level (quantityLot=" +
+                                 std::to_string(l.quantityLot) + ")");
     return l;
 }
 

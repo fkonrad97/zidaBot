@@ -98,10 +98,11 @@ Synced
 
 | Method | Description |
 |---|---|
-| `onSnapshot(msg, BaselineKind)` | Bulk-loads the snapshot. `RestAnchored` → `WaitingBridge`; `WsAuthoritative` → `Synced`. |
-| `onIncrement(msg)` | Validates `prev_last == last_seq_`, applies deltas. Returns `NeedResync` on a gap. |
+| `onSnapshot(msg, BaselineKind)` | Bulk-loads the snapshot. `RestAnchored` → `WaitingBridge`; `WsAuthoritative` → `Synced`. Accepts `checksum=0` as best-effort (no validation, not a resync trigger). Returns `NeedResync` if checksum is non-zero but mismatches. |
+| `onIncrement(msg)` | Validates sequence continuity, applies deltas, checks C1 crossed-book guard, optional C3 periodic validate. Returns `NeedResync` on failure. |
 | `configureChecksum(fn, topN)` | Attach a checksum validator; called once during adapter init. |
-| `setAllowSequenceGap(bool)` | When `true`, non-contiguous sequence increments are accepted (brain mid-stream join, KuCoin). |
+| `setAllowSequenceGap(bool)` | When `true`, non-contiguous sequence increments are accepted (brain mid-stream join, KuCoin, Bitget). |
+| `setValidatePeriod(n)` | Call `OrderBook::validate()` every `n` applied increments (C3). `0` = disabled. Triggers `NeedResync` on failure. |
 | `resetBook()` | Full reset to `WaitingSnapshot`, clears the book and sequence state. |
 | `isSynced()` | Returns `true` when state is `Synced`. |
 | `book()` | Read-only reference to the inner `OrderBook`. |
@@ -114,6 +115,15 @@ enum class Action { None, NeedResync };
 ```
 
 Callers must trigger a full resync when `NeedResync` is returned.
+
+**Integrity guards applied in `onIncrement` (steady-state)**
+
+| Guard | Trigger | Action |
+|---|---|---|
+| C1 crossed-book | `best_bid.priceTick >= best_ask.priceTick` after apply | `NeedResync("book_crossed")` |
+| C3 periodic validate | every `validate_period_` updates | `NeedResync("validate_failed")` if `book_.validate()` returns false |
+| Checksum | every incremental when `checksum_fn_ != nullptr` | `NeedResync("steady_state_checksum_mismatch")` on mismatch |
+| Sequence gap | `first_seq > expected_seq_` when `allow_seq_gap_ == false` | `NeedResync("steady_state_sequence_gap")` |
 
 ---
 

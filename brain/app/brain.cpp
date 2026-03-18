@@ -6,6 +6,7 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/signal_set.hpp>
 #include <boost/asio/ssl/context.hpp>
+#include <boost/asio/steady_timer.hpp>
 
 #include <nlohmann/json.hpp>
 #include <openssl/ssl.h>
@@ -46,10 +47,17 @@ int main(int argc, char **argv) {
     boost::asio::io_context ioc;
 
     brain::UnifiedBook book(opts.depth);
+    const std::uint64_t output_max_bytes =
+        opts.output_max_mb > 0 ? opts.output_max_mb * 1024ULL * 1024ULL : 0;
+
     brain::ArbDetector arb(
         opts.min_spread_bps,
-        opts.max_age_ms * 1'000'000LL,
-        opts.output
+        opts.max_spread_bps,
+        opts.rate_limit_ms * 1'000'000LL,
+        opts.max_age_ms    * 1'000'000LL,
+        opts.max_price_deviation_pct,
+        opts.output,
+        output_max_bytes
     );
 
     // ---- Message callback ----
@@ -71,18 +79,69 @@ int main(int argc, char **argv) {
     brain::WsServer server(ioc, ssl_ctx, ep, on_message);
     server.start();
 
+    // ---- D4: brain watchdog ----
+    boost::asio::steady_timer watchdog_timer(ioc);
+    const std::int64_t watchdog_no_cross_ns =
+        opts.watchdog_no_cross_sec > 0
+            ? opts.watchdog_no_cross_sec * 1'000'000'000LL
+            : 0;
+
+    std::function<void()> arm_watchdog;
+    arm_watchdog = [&]() {
+        watchdog_timer.expires_after(std::chrono::seconds(60));
+        watchdog_timer.async_wait([&](const boost::system::error_code &ec) {
+            if (ec) return;
+
+            const std::size_t synced = book.synced_count();
+            if (synced == 0) {
+                std::cerr << "[brain] WATCHDOG: WARNING — no synced venues (synced_count=0)\n";
+            } else if (synced == 1) {
+                std::cerr << "[brain] WATCHDOG: INFO — only 1 synced venue, arb scan suspended\n";
+            }
+
+            if (watchdog_no_cross_ns > 0 && synced >= 2) {
+                const std::int64_t last = arb.last_cross_ns();
+                if (last > 0) {
+                    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    if (now - last > watchdog_no_cross_ns) {
+                        std::cerr << "[brain] WATCHDOG: WARNING — no arb cross in "
+                                  << (now - last) / 1'000'000'000LL << "s"
+                                  << " (threshold=" << opts.watchdog_no_cross_sec << "s)\n";
+                    }
+                }
+            }
+
+            arm_watchdog();
+        });
+    };
+    arm_watchdog();
+
     // ---- Signal handling ----
     boost::asio::signal_set signals(ioc, SIGINT, SIGTERM);
     signals.async_wait([&](const boost::system::error_code &, int) {
         std::cerr << "[brain] shutting down\n";
+        watchdog_timer.cancel();
         arb.flush();
         server.stop();
         ioc.stop();
     });
 
-    std::cerr << "[brain] running (depth=" << opts.depth
+    std::cerr << "[brain] running"
+              << " depth=" << opts.depth
               << " min_spread=" << opts.min_spread_bps << "bps"
-              << " max_age=" << opts.max_age_ms << "ms)\n";
+              << " max_spread=" << (opts.max_spread_bps > 0.0
+                    ? std::to_string(opts.max_spread_bps) + "bps" : "no-cap")
+              << " rate_limit=" << (opts.rate_limit_ms > 0
+                    ? std::to_string(opts.rate_limit_ms) + "ms" : "off")
+              << " max_age=" << opts.max_age_ms << "ms"
+              << " max_price_dev=" << (opts.max_price_deviation_pct > 0.0
+                    ? std::to_string(opts.max_price_deviation_pct) + "%" : "off")
+              << " output_max=" << (opts.output_max_mb > 0
+                    ? std::to_string(opts.output_max_mb) + "MB" : "no-rotation")
+              << " watchdog_no_cross=" << (opts.watchdog_no_cross_sec > 0
+                    ? std::to_string(opts.watchdog_no_cross_sec) + "s" : "off")
+              << "\n";
 
     ioc.run();
     return 0;

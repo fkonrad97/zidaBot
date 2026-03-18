@@ -1,6 +1,7 @@
 #include "md/GenericFeedHandler.hpp"
 #include <chrono>
 #include <iostream>
+#include <random>
 
 namespace md
 {
@@ -14,7 +15,8 @@ namespace md
                                                                            ws_(WsClient::create(ioc)),
                                                                            rest_(RestClient::create(ioc)),
                                                                            reconnect_timer_(ioc),
-                                                                           ws_watchdog_timer_(ioc)
+                                                                           ws_watchdog_timer_(ioc),
+                                                                           heartbeat_timer_(ioc)
     {
         rest_->set_keep_alive(true); // strongly recommended for snapshots
         rest_->set_logger([](std::string_view s)
@@ -72,6 +74,11 @@ namespace md
         }
         std::cerr << "\n";
         state_ = next;
+
+        // B6: reset reconnect backoff once we successfully reach SYNCED
+        if (next == FeedSyncState::SYNCED) {
+            reset_reconnect_delay_();
+        }
 
         if (brain_publish_) {
             std::string_view feed_state;
@@ -151,6 +158,11 @@ namespace md
         if (rt_.caps.allow_seq_gap)
         {
             std::cerr << "[GenericFeedHandler] ALLOW_SEQ_GAP enabled for venue\n";
+        }
+        // C3: optional periodic book validation
+        if (cfg_.validate_every > 0) {
+            controller_->setValidatePeriod(static_cast<std::size_t>(cfg_.validate_every));
+            std::cerr << "[GenericFeedHandler] validate_every=" << cfg_.validate_every << "\n";
         }
 
         persist_.reset();
@@ -237,6 +249,7 @@ namespace md
             return FeedOpResult::OK;
         }
 
+        arm_heartbeat_();
         connectWS();
         return FeedOpResult::OK;
     }
@@ -252,6 +265,7 @@ namespace md
         if (brain_publish_)
             brain_publish_->stop();
         disarm_ws_watchdog_();
+        heartbeat_timer_.cancel();
 
         set_state_(FeedSyncState::DISCONNECTED, "stop");
         buffer_.clear();
@@ -349,6 +363,8 @@ namespace md
                   << " target=" << rt_.restSnapshotTarget
                   << "\n";
 
+        rest_request_start_ns_ = now_ns_(); // C4: track REST request latency
+
         rest_->async_get(rt_.rest.host, rt_.rest.port, rt_.restSnapshotTarget,
                          [this](boost::system::error_code ec, std::string body)
                          {
@@ -398,10 +414,24 @@ namespace md
         if (!running_.load())
             return;
         const std::int64_t recv_ts_ns = now_ns_();
-        std::cerr << "[GenericFeedHandler] received REST snapshot response"
-                  << " venue=" << to_string(rt_.venue)
-                  << " body_bytes=" << body.size()
-                  << "\n";
+
+        // C4: REST snapshot staleness diagnostics
+        {
+            const std::int64_t rest_latency_ms = (recv_ts_ns - rest_request_start_ns_) / 1'000'000LL;
+            const std::size_t buffered = buffer_.size();
+            std::cerr << "[GenericFeedHandler] received REST snapshot response"
+                      << " venue=" << to_string(rt_.venue)
+                      << " body_bytes=" << body.size()
+                      << " rest_latency_ms=" << rest_latency_ms
+                      << " buffered_incrementals=" << buffered;
+            if (rest_latency_ms > static_cast<std::int64_t>(cfg_.rest_timeout_ms) * 80 / 100) {
+                std::cerr << " [WARN: REST near timeout]";
+            }
+            if (buffered > max_buffer_ / 2) {
+                std::cerr << " [WARN: buffer half-full, snapshot may be very stale]";
+            }
+            std::cerr << "\n";
+        }
 
         GenericSnapshotFormat snap;
         const bool ok = std::visit([&](auto const &a)
@@ -421,7 +451,12 @@ namespace md
                 ? OrderBookController::BaselineKind::RestAnchored
                 : OrderBookController::BaselineKind::WsAuthoritative;
 
-        controller_->onSnapshot(snap, kind);
+        const auto snap_action = controller_->onSnapshot(snap, kind);
+        if (snap_action == OrderBookController::Action::NeedResync)
+        {
+            restartSync("rest_snapshot_rejected");
+            return;
+        }
         maybe_persist_book_("snapshot_applied");
 
         /// Baseline loaded. We are not necessarily synced yet (RestAnchored must bridge).
@@ -475,6 +510,7 @@ namespace md
     {
         if (!running_.load() || len == 0)
             return;
+        ++ctr_msgs_received_;
         std::string_view msg{data, len};
         const std::int64_t recv_ts_ns = now_ns_();
         last_ws_message_ns_ = recv_ts_ns;
@@ -506,7 +542,13 @@ namespace md
             {
                 snap.ts_recv_ns = recv_ts_ns;
                 persist_snapshot_(snap, "ws_snapshot");
-                controller_->onSnapshot(snap, OrderBookController::BaselineKind::WsAuthoritative);
+                const auto snap_action = controller_->onSnapshot(
+                    snap, OrderBookController::BaselineKind::WsAuthoritative);
+                if (snap_action == OrderBookController::Action::NeedResync)
+                {
+                    restartSync("ws_snapshot_rejected");
+                    return;
+                }
                 maybe_persist_book_("snapshot_applied");
 
                 // baseline is WS snapshot; any buffered msgs were pre-baseline, drain them now
@@ -543,7 +585,13 @@ namespace md
                 // Hard re-baseline (venue may resend snapshot on internal resync)
                 snap.ts_recv_ns = recv_ts_ns;
                 persist_snapshot_(snap, "ws_snapshot");
-                controller_->onSnapshot(snap, OrderBookController::BaselineKind::WsAuthoritative);
+                const auto snap_action = controller_->onSnapshot(
+                    snap, OrderBookController::BaselineKind::WsAuthoritative);
+                if (snap_action == OrderBookController::Action::NeedResync)
+                {
+                    restartSync("interrupting_ws_snapshot_rejected");
+                    return;
+                }
                 maybe_persist_book_("snapshot_applied");
 
                 // Any buffered incrementals are stale relative to this new baseline.
@@ -604,6 +652,7 @@ namespace md
                 restartSync("steady_state_incremental_need_resync");
                 return;
             }
+            ++ctr_book_updates_;
             maybe_persist_book_("incremental_applied");
 
             if (state_ == FeedSyncState::WAIT_BRIDGE && controller_->isSynced())
@@ -623,6 +672,7 @@ namespace md
         if (!running_.load())
             return;
 
+        ++ctr_resyncs_;
         std::cerr << "[GenericFeedHandler] restart sync"
                   << " venue=" << to_string(rt_.venue)
                   << " state=" << sync_state_to_string_(state_);
@@ -642,11 +692,11 @@ namespace md
         // Correlate bootstrap if needed
         connect_id_ = makeConnectId();
 
-        // Force-close current WS (immediate) and reconnect after a short backoff.
+        // Force-close current WS (immediate) and reconnect after exponential backoff.
         closing_for_restart_ = true;
         ws_->cancel();
 
-        schedule_ws_reconnect_(std::chrono::milliseconds(200));
+        schedule_ws_reconnect_(next_reconnect_delay_());
     }
 
     void GenericFeedHandler::bootstrapWS()
@@ -804,6 +854,26 @@ namespace md
         ws_watchdog_timer_.cancel();
     }
 
+    // B6: exponential backoff helpers
+
+    std::chrono::milliseconds GenericFeedHandler::next_reconnect_delay_() noexcept {
+        // Apply ±25 % jitter using a thread_local PRNG (no locks needed on single-threaded Asio)
+        static thread_local std::mt19937 rng{std::random_device{}()};
+        static thread_local std::uniform_real_distribution<double> jitter(-0.25, 0.25);
+
+        const int base = reconnect_delay_ms_;
+        const int jittered = static_cast<int>(base * (1.0 + jitter(rng)));
+
+        // Advance backoff: double for next call, capped at max
+        reconnect_delay_ms_ = std::min(reconnect_delay_ms_ * 2, kReconnectMaxMs);
+
+        return std::chrono::milliseconds(std::max(100, jittered)); // floor at 100 ms
+    }
+
+    void GenericFeedHandler::reset_reconnect_delay_() noexcept {
+        reconnect_delay_ms_ = kReconnectInitMs;
+    }
+
     void GenericFeedHandler::persist_snapshot_(const GenericSnapshotFormat &snap, std::string_view source)
     {
         if (persist_) persist_->write_snapshot(snap, source);
@@ -847,5 +917,46 @@ namespace md
                                                source,
                                                ts_book_ns);
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // D2: per-feed heartbeat
+
+    void GenericFeedHandler::arm_heartbeat_()
+    {
+        constexpr int kIntervalSec = 60;
+        heartbeat_timer_.expires_after(std::chrono::seconds(kIntervalSec));
+        heartbeat_timer_.async_wait([this](const boost::system::error_code &ec)
+        {
+            if (ec || !running_.load()) return;
+            emit_heartbeat_();
+            arm_heartbeat_(); // re-arm
+        });
+    }
+
+    void GenericFeedHandler::emit_heartbeat_()
+    {
+        constexpr int kIntervalSec = 60;
+        const std::string venue = to_string(rt_.venue);
+        const std::string state = sync_state_to_string_(state_);
+        const std::uint64_t msgs_per_sec = ctr_msgs_received_ / kIntervalSec;
+        std::cerr << "[HEARTBEAT] venue=" << venue
+                  << " state=" << state
+                  << " msgs_received=" << ctr_msgs_received_
+                  << " msgs_per_sec=" << msgs_per_sec
+                  << " book_updates=" << ctr_book_updates_
+                  << " resyncs=" << ctr_resyncs_;
+
+        // C2: warn if rate exceeds 2× configured ceiling
+        if (cfg_.max_msg_rate_per_sec > 0 &&
+            msgs_per_sec > static_cast<std::uint64_t>(cfg_.max_msg_rate_per_sec) * 2) {
+            std::cerr << " [WARN: msg rate " << msgs_per_sec
+                      << "/s exceeds 2x ceiling " << cfg_.max_msg_rate_per_sec << "/s]";
+        }
+
+        std::cerr << "\n";
+        // Reset per-interval counters; lifetime counters (resyncs) are kept
+        ctr_msgs_received_ = 0;
+        ctr_book_updates_  = 0;
     }
 }

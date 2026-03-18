@@ -40,9 +40,17 @@ namespace md {
     std::string BybitAdapter::wsSubscribeFrame(const FeedHandlerConfig &cfg) const {
         const std::string instId = venue::map_ws_symbol(VenueId::BYBIT, cfg.base_ccy, cfg.quote_ccy);
 
+        // Bybit spot WS orderbook only supports depths 1, 50, 200.
+        // Snap the requested depth to the largest valid value that does not exceed it.
+        // Depths above 200 are silently ignored by Bybit (no data arrives), so we must cap.
+        std::size_t depth = cfg.depthLevel;
+        if (depth >= 200) depth = 200;
+        else if (depth >= 50) depth = 50;
+        else depth = 1;
+
         json j;
         j["op"] = "subscribe";
-        j["args"] = json::array({"orderbook." + std::to_string(cfg.depthLevel) + "." + instId});
+        j["args"] = json::array({"orderbook." + std::to_string(depth) + "." + instId});
         return j.dump();
     }
 

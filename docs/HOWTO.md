@@ -137,9 +137,14 @@ Brain must be started **before** PoP instances connect.
 | `--certfile` | required | TLS cert PEM |
 | `--keyfile` | required | TLS key PEM |
 | `--output` | (none) | Arb signal JSONL output file |
-| `--min-spread-bps` | 0 | Only emit crosses above this threshold |
-| `--max-age-ms` | 5000 | Staleness guard: max age of each individual book (absolute) AND max age difference between the two books (relative), both in ms |
+| `--min-spread-bps` | 0 | Only emit crosses at or above this threshold in bps (0 = all) |
+| `--max-spread-bps` | 0 | Suppress crosses above this threshold (0 = no cap); logged as anomalies |
+| `--rate-limit-ms` | 1000 | Suppress repeated signals for the same (sell, buy) pair within this window (ms) |
+| `--max-age-ms` | 5000 | Staleness guard: max individual book age AND max age diff between the two books (ms) |
+| `--max-price-deviation-pct` | 0 | Skip venues deviating > N% from median best_bid across all synced venues (0 = off) |
 | `--depth` | 50 | Order book depth per venue |
+| `--output-max-mb` | 0 | Rotate `--output` at this file size in MB (0 = no rotation) |
+| `--watchdog-no-cross-sec` | 0 | Warn if no cross emitted for N seconds while ≥ 2 venues synced (0 = off) |
 
 Brain prints detected arb crosses to **stderr** and optionally to the `--output` JSONL file. PoP connections/disconnections are also logged to stderr.
 
@@ -186,7 +191,7 @@ One PoP process per venue. Requires `--venue`, `--base`, and `--quote`.
 | `--venue` | required | Exchange name |
 | `--base` | required | Base asset (e.g. `BTC`) |
 | `--quote` | required | Quote asset (e.g. `USDT`) |
-| `--depthLevel` | 400 | Local order book depth |
+| `--depthLevel` | 400 | Local order book depth (Bybit caps to nearest of 1/50/200 automatically) |
 | `--brain_ws_host` | (none) | Brain hostname — enables publishing |
 | `--brain_ws_port` | (none) | Brain port |
 | `--brain_ws_path` | (none) | Brain WS path (e.g. `/`) |
@@ -195,14 +200,16 @@ One PoP process per venue. Requires `--venue`, `--base`, and `--quote`.
 | `--persist_book_every_updates` | 0 | `book_state` checkpoint frequency (0 = off) |
 | `--persist_book_top` | 50 | Levels per side in `book_state` |
 | `--rest_timeout_ms` | 8000 | REST snapshot request timeout in ms |
+| `--max_msg_rate` | 0 | Warn if msgs/sec > 2× this value at heartbeat (0 = off) |
+| `--validate_every` | 0 | Periodic `OrderBook::validate()` every N updates; resync on failure (0 = off) |
 | `--log_path` | (none) | Write process log to file |
 | `--debug` | false | Rate-limited book/seq debug output |
 
 ---
 
-## 6. End-to-End Test (Brain + 2 PoP instances)
+## 6. End-to-End Test (Brain + all 5 PoP instances)
 
-Open **three terminals** from the repo root.
+Open six terminals from the repo root (or use a terminal multiplexer).
 
 **Terminal 1 — Brain**
 ```bash
@@ -215,38 +222,47 @@ Open **three terminals** from the repo root.
   --depth 50
 ```
 
-**Terminal 2 — Binance PoP**
+**Terminals 2–6 — One PoP per venue**
 ```bash
-./build/pop/pop \
-  --venue binance --base BTC --quote USDT \
+# Binance
+./build/pop/pop --venue binance --base BTC --quote USDT \
   --brain_ws_host 127.0.0.1 --brain_ws_port 8443 --brain_ws_path / \
-  --brain_ws_insecure \
-  --persist_book_every_updates 500 --persist_book_top 20 \
-  --debug
+  --brain_ws_insecure --persist_book_every_updates 500 --persist_book_top 20
+
+# OKX
+./build/pop/pop --venue okx --base BTC --quote USDT \
+  --brain_ws_host 127.0.0.1 --brain_ws_port 8443 --brain_ws_path / \
+  --brain_ws_insecure --persist_book_every_updates 500 --persist_book_top 20
+
+# Bybit  (depth automatically capped to 50)
+./build/pop/pop --venue bybit --base BTC --quote USDT \
+  --brain_ws_host 127.0.0.1 --brain_ws_port 8443 --brain_ws_path / \
+  --brain_ws_insecure --persist_book_every_updates 500 --persist_book_top 20
+
+# Bitget
+./build/pop/pop --venue bitget --base BTC --quote USDT \
+  --brain_ws_host 127.0.0.1 --brain_ws_port 8443 --brain_ws_path / \
+  --brain_ws_insecure --persist_book_every_updates 500 --persist_book_top 20
+
+# KuCoin
+./build/pop/pop --venue kucoin --base BTC --quote USDT \
+  --brain_ws_host 127.0.0.1 --brain_ws_port 8443 --brain_ws_path / \
+  --brain_ws_insecure --persist_book_every_updates 500 --persist_book_top 20
 ```
 
-**Terminal 3 — OKX PoP**
-```bash
-./build/pop/pop \
-  --venue okx --base BTC --quote USDT \
-  --brain_ws_host 127.0.0.1 --brain_ws_port 8443 --brain_ws_path / \
-  --brain_ws_insecure \
-  --persist_book_every_updates 500 --persist_book_top 20 \
-  --debug
-```
-
-**Optional Terminal 4 — Watch arb output live**
+**Optional — Watch arb output live**
 ```bash
 tail -f /tmp/arb.jsonl
 ```
 
 **Expected sequence of events:**
 1. Brain starts and listens on port 8443.
-2. Each PoP connects → brain logs `[WsSession] accepted from 127.0.0.1:...`.
-3. PoP bootstraps (REST snapshot + WS sync) → logs `→ SYNCED`.
-4. PoP begins sending `book_state` frames every 500 updates.
+2. Each PoP connects → brain logs `[WsServer] client connected addr=127.0.0.1`.
+3. PoP bootstraps → logs `state … -> SYNCED venue=<venue>`.
+4. PoP sends `book_state` frames every 500 updates; brain transitions venue to synced.
 5. Once brain has ≥ 2 synced venues, arb scan runs on every incoming event.
-6. Any crosses appear on brain stderr and in `/tmp/arb.jsonl`.
+6. Crosses appear on brain stderr and in `/tmp/arb.jsonl`.
+7. Brain watchdog fires every 60 s; warns if `synced_count == 0`.
 
 ---
 
@@ -306,6 +322,21 @@ tail -f /tmp/arb.jsonl
   --max-age-ms 2000 \
   --output /tmp/arb.jsonl
 
+# With anomaly suppression + rate limit + per-pair signal cap
+./build/brain/brain \
+  --certfile /tmp/brain_cert.pem --keyfile /tmp/brain_key.pem \
+  --min-spread-bps 0 --max-spread-bps 50 \
+  --rate-limit-ms 500 \
+  --max-price-deviation-pct 1.0 \
+  --output /tmp/arb.jsonl
+
+# With file rotation and watchdog
+./build/brain/brain \
+  --certfile /tmp/brain_cert.pem --keyfile /tmp/brain_key.pem \
+  --output /tmp/arb.jsonl \
+  --output-max-mb 100 \
+  --watchdog-no-cross-sec 60
+
 # Deeper book (more levels for context, not used in arb scan itself)
 ./build/brain/brain \
   --certfile /tmp/brain_cert.pem --keyfile /tmp/brain_key.pem \
@@ -348,5 +379,14 @@ cmake --build build -j4
 
 **PoP reconnects frequently (watchdog firing)**
 - The exchange connection is dropping — normal on unstable networks.
-- PoP will log `restartSync: watchdog` and reconnect automatically.
+- PoP will log `restartSync: watchdog` and reconnect automatically with exponential backoff (1 s → 60 s).
 - Use `--debug` to see the reconnect sequence.
+
+**Bybit PoP connects but no book messages arrive**
+- Bybit spot WebSocket only supports depths **1, 50, or 200**. The adapter automatically caps `--depthLevel` to the nearest valid value. If you passed a depth like `400`, it was silently ignored by the server before the fix.
+- Verify the subscribe message in the log: it should say `orderbook.50.BTCUSDT` (or `1`/`200`), never an arbitrary depth.
+
+**Bitget PoP enters a resync loop (`steady_state_sequence_gap` or `snapshot_missing_checksum`)**
+- Bitget's WS snapshot is prepared at subscribe-time; by the time the handler processes it, the live stream has typically advanced by hundreds of updates. This is expected — `allow_seq_gap=true` is set for Bitget and handles this.
+- CRC-32 checksum validation is intentionally disabled for Bitget because the unverified baseline makes incremental checksums unreliable. Structural integrity is maintained by the crossed-book guard (C1) and periodic validate (C3).
+- If you see a resync loop, check whether the `BitgetAdapter::caps()` still has `has_checksum=false` and `allow_seq_gap=true`.

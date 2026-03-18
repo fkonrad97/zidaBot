@@ -19,9 +19,14 @@ Parsed by `brain/include/brain/BrainCmdLine.hpp` into `BrainOptions`.
 | `--certfile` | — | **Yes** | TLS certificate PEM file |
 | `--keyfile` | — | **Yes** | TLS private key PEM file |
 | `--output` | — | No | Arb signal output JSONL file path |
-| `--min-spread-bps` | `0.0` | No | Minimum spread in bps to emit (0 = all crosses) |
-| `--max-age-ms` | `5000` | No | Max book-age difference (ms) for staleness guard |
+| `--min-spread-bps` | `0.0` | No | Only emit crosses at or above this threshold in bps (0 = all) |
+| `--max-spread-bps` | `0.0` | No | Suppress crosses above this threshold (0 = no cap); logged as anomalies |
+| `--rate-limit-ms` | `1000` | No | Per-pair cross rate limit in ms; repeated signals within window are suppressed |
+| `--max-age-ms` | `5000` | No | Max individual book age AND max age difference between the two books (both in ms) |
+| `--max-price-deviation-pct` | `0.0` | No | Skip venues whose best_bid deviates more than N% from the median across all synced venues (0 = off) |
 | `--depth` | `50` | No | Order book depth per venue |
+| `--output-max-mb` | `0` | No | Rotate `--output` file at this size in MB (0 = no rotation); rotated files are renamed `.1`, `.2`, … |
+| `--watchdog-no-cross-sec` | `0` | No | Warn on stderr if no arb cross is emitted for this many seconds while ≥ 2 venues are synced (0 = off) |
 
 **Generating a self-signed cert for local dev:**
 
@@ -82,7 +87,7 @@ namespace brain {
     };
 
     EventHeader              parse_header           (const nlohmann::json &j);  // throws on schema_version != 1
-    Level                    parse_level            (const nlohmann::json &lvl);
+    Level                    parse_level            (const nlohmann::json &lvl);  // throws on priceTick <= 0 or quantityLot < 0
     GenericSnapshotFormat    parse_snapshot         (const nlohmann::json &j);
     GenericIncrementalFormat parse_incremental      (const nlohmann::json &j);
     GenericSnapshotFormat    parse_book_state_as_snapshot(const nlohmann::json &j);
@@ -93,6 +98,8 @@ namespace brain {
 `priceTick` and `quantityLot` are read directly as integers from the JSON (pre-computed by PoP); no `parsePriceToTicks` conversion is needed here. `parse_book_state_as_snapshot` maps `applied_seq` to `lastUpdateId` so the result can be passed to `onSnapshot(WsAuthoritative)`.
 
 `parse_header` enforces `schema_version == 1` and throws `std::runtime_error` if a different version is received. This prevents silent corruption if a future PoP version changes the wire format.
+
+`parse_level` validates each level: throws `std::invalid_argument` if `priceTick <= 0` (non-positive price) or `quantityLot < 0` (negative quantity). This catches malformed data from PoP before it can corrupt the book.
 
 ---
 
@@ -118,6 +125,8 @@ struct VenueBook {
 The controller has `setAllowSequenceGap(true)` set (brain may join mid-stream; sequence continuity is not enforceable).
 
 `feed_healthy` is an explicit liveness flag driven by PoP's `status` events. It prevents arb scanning from using a book that was internally `Synced` but whose exchange feed is now down.
+
+**Timestamp sanitization**: `ts_book_ns` values from PoP are passed through `sanitize_ts()` before storage. Timestamps more than 60 s in the future are clamped to now (prevents the staleness guard being permanently bypassed). Timestamps more than 5 min in the past are logged as a warning but kept (so `ArbDetector`'s age guard can reject them normally).
 
 ---
 
@@ -166,9 +175,13 @@ struct ArbCross {
 };
 
 class ArbDetector {
-    ArbDetector(double min_spread_bps, int64_t max_age_diff_ns, std::string output_path);
+    ArbDetector(double min_spread_bps, double max_spread_bps,
+                int64_t rate_limit_ns, int64_t max_age_diff_ns,
+                double max_price_deviation_pct,
+                std::string output_path, uint64_t output_max_bytes = 0);
     std::vector<ArbCross> scan(const std::vector<VenueBook> &venues);
-    void flush() noexcept;  // flush output file; call before shutdown
+    void flush() noexcept;         // flush output file; call before shutdown
+    int64_t last_cross_ns() const; // timestamp of most recent emitted cross (for D4 watchdog)
 };
 ```
 
@@ -178,9 +191,10 @@ For every directed pair `(sell, buy)` where `sell != buy`:
 
 1. Both books must pass `synced()` (i.e. `feed_healthy && controller->isSynced()`).
 2. Neither `best_bid.priceTick` nor `best_ask.priceTick` may be zero (empty sentinel).
-3. Cross: `sell.best_bid.priceTick > buy.best_ask.priceTick`.
-4. **Individual book age**: `now - sell.ts_book_ns <= max_age_diff_ns` AND `now - buy.ts_book_ns <= max_age_diff_ns` — catches two books both stale by the same absolute amount.
-5. **Relative staleness**: `|sell.ts_book_ns - buy.ts_book_ns| <= max_age_diff_ns` — catches books that diverged in time from each other.
+3. **Price sanity (B5)**: if `--max-price-deviation-pct > 0`, compute the median `best_bid` across all synced venues; skip any venue whose `best_bid` deviates from the median by more than the configured percent. Anomalies are logged to stderr.
+4. Cross: `sell.best_bid.priceTick > buy.best_ask.priceTick`.
+5. **Individual book age**: `now - sell.ts_book_ns <= max_age_diff_ns` AND `now - buy.ts_book_ns <= max_age_diff_ns` — catches two books both stale by the same absolute amount.
+6. **Relative staleness**: `|sell.ts_book_ns - buy.ts_book_ns| <= max_age_diff_ns` — catches books that diverged in time from each other.
 
 ```
 mid        = (sell_bid_tick + buy_ask_tick) / 2   (skipped if mid <= 0)
@@ -189,11 +203,14 @@ spread_bps = ((sell_bid_tick - buy_ask_tick) / mid) × 10 000
 
 Since `priceTick = price × 100` uniformly across all venues, the ratio is dimensionless and `spread_bps` is correct without any additional conversion.
 
+Crosses above `max_spread_bps` (when `> 0`) are logged as anomalies and suppressed. Per-pair rate limiting (`rate_limit_ns`) drops repeated signals for the same `(sell, buy)` pair within the configured window.
+
 **Output**
 
 Each detected cross is:
 - Printed to stderr.
 - Appended as a JSON line to `--output` if configured.
+- When `--output-max-mb > 0`, the output file is rotated at the configured size: the current file is renamed to `.1` (bumping any existing `.1` → `.2`, etc.) and a fresh file is opened.
 - `flush()` is called in the SIGINT/SIGTERM handler before `ioc.stop()` to prevent partial-line loss on shutdown.
 
 ---

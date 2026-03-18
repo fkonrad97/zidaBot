@@ -61,6 +61,10 @@ namespace md {
         /// instead of forcing a resync.  Defaults to false (strict continuity).
         void setAllowSequenceGap(bool allow) noexcept { allow_seq_gap_ = allow; }
 
+        /// C3: call OrderBook::validate() every N applied incremental updates.
+        /// On a sort-order or uniqueness violation, triggers a resync.  0 = disabled.
+        void setValidatePeriod(std::size_t n) noexcept { validate_period_ = n; }
+
         enum class BaselineKind : std::uint8_t { RestAnchored, WsAuthoritative };
 
         enum class Action {
@@ -131,6 +135,10 @@ namespace md {
         std::size_t checksum_topN_{25};
 
         bool allow_seq_gap_{false};
+
+        // C3: periodic book validation
+        std::size_t validate_period_{0};   ///< 0 = disabled; else validate every N updates
+        std::size_t validate_counter_{0};
 
         bool validateChecksum(std::int64_t expected) const noexcept {
             if (!checksum_fn_) return true;

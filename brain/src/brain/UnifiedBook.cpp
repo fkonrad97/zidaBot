@@ -1,9 +1,39 @@
 #include "brain/UnifiedBook.hpp"
 #include "brain/JsonParsers.hpp"
 
+#include <chrono>
 #include <iostream>
 
 namespace brain {
+
+namespace {
+/// Return system clock time in nanoseconds since epoch.
+inline std::int64_t now_ns() noexcept {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+/// Validate and sanitize ts_book_ns from PoP.
+/// - Clamps future timestamps (>60 s ahead) to now to prevent the staleness
+///   guard being permanently bypassed.
+/// - Logs a warning on very old timestamps (>5 min behind) but keeps them so
+///   ArbDetector's age guard can reject the book normally.
+inline std::int64_t sanitize_ts(std::int64_t ts, std::string_view venue) noexcept {
+    constexpr std::int64_t kMaxFutureNs = 60LL  * 1'000'000'000LL; // 60 s
+    constexpr std::int64_t kWarnPastNs  = 300LL * 1'000'000'000LL; // 5 min
+    const std::int64_t ts_now = now_ns();
+    if (ts > ts_now + kMaxFutureNs) {
+        std::cerr << "[UnifiedBook] WARNING: future ts_book_ns from venue=" << venue
+                  << " diff=+" << (ts - ts_now) / 1'000'000 << "ms — clamped to now\n";
+        return ts_now;
+    }
+    if (ts > 0 && ts < ts_now - kWarnPastNs) {
+        std::cerr << "[UnifiedBook] WARNING: stale ts_book_ns from venue=" << venue
+                  << " age=" << (ts_now - ts) / 1'000'000 << "ms\n";
+    }
+    return ts;
+}
+} // namespace
 
 // ---------------------------------------------------------------------------
 // VenueBook
@@ -61,16 +91,19 @@ std::string UnifiedBook::on_event(const nlohmann::json &j) {
     try {
         if (hdr.event_type == "snapshot") {
             auto snap = parse_snapshot(j);
-            vb->ts_book_ns   = snap.ts_recv_ns;
+            vb->ts_book_ns   = sanitize_ts(snap.ts_recv_ns, hdr.venue);
             vb->feed_healthy = true;
             const auto action = vb->controller->onSnapshot(
                 snap, md::OrderBookController::BaselineKind::WsAuthoritative);
-            if (action == md::OrderBookController::Action::NeedResync)
-                std::cerr << "[UnifiedBook] NeedResync after snapshot venue=" << hdr.venue << "\n";
+            if (action == md::OrderBookController::Action::NeedResync) {
+                std::cerr << "[UnifiedBook] NeedResync after snapshot venue=" << hdr.venue
+                          << " — book cleared, awaiting next event\n";
+                vb->feed_healthy = false; // don't use this venue until resync succeeds
+            }
 
         } else if (hdr.event_type == "incremental") {
             auto inc = parse_incremental(j);
-            vb->ts_book_ns   = inc.ts_recv_ns;
+            vb->ts_book_ns   = sanitize_ts(inc.ts_recv_ns, hdr.venue);
             vb->feed_healthy = true;
             const auto action = vb->controller->onIncrement(inc);
             if (action == md::OrderBookController::Action::NeedResync)
@@ -78,7 +111,7 @@ std::string UnifiedBook::on_event(const nlohmann::json &j) {
                           << " — awaiting next book_state\n";
 
         } else if (hdr.event_type == "book_state") {
-            vb->ts_book_ns   = extract_ts_book_ns(j);
+            vb->ts_book_ns   = sanitize_ts(extract_ts_book_ns(j), hdr.venue);
             vb->feed_healthy = true;
             auto snap = parse_book_state_as_snapshot(j);
             const auto action = vb->controller->onSnapshot(

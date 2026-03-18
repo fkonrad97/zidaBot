@@ -14,7 +14,12 @@ struct BrainOptions {
     std::string keyfile;        ///< Required: TLS private key PEM
     std::string output;         ///< Optional: arb signal JSONL output file path
     double      min_spread_bps{0.0};
+    double      max_spread_bps{0.0};  ///< 0 = no upper cap; >0 logs anomaly + suppresses
+    std::int64_t rate_limit_ms{1000}; ///< min ms between signals for same (sell,buy) pair; 0 = off
     std::int64_t max_age_ms{5000};
+    double      max_price_deviation_pct{0.0}; ///< B5: 0 = disabled; skip venues deviating > N % from median
+    std::size_t output_max_mb{0};             ///< D3: rotate arb output after N MB (0 = no rotation)
+    std::int64_t watchdog_no_cross_sec{0};    ///< D4: warn if no cross in this many seconds (0 = disabled)
     std::size_t depth{50};      ///< OrderBook depth per venue
     bool        show_help{false};
 };
@@ -37,8 +42,18 @@ inline bool parse_brain_cmdline(int argc, char **argv, BrainOptions &out) {
                           "Arb signal output JSONL file path")
         ("min-spread-bps",po::value<double>()->default_value(0.0),
                           "Minimum spread in bps to emit (default 0 = all crosses)")
+        ("max-spread-bps",po::value<double>()->default_value(0.0),
+                          "Upper spread cap in bps; crosses above this are logged as anomalies and suppressed (0 = no cap)")
+        ("rate-limit-ms", po::value<std::int64_t>()->default_value(1000),
+                          "Min milliseconds between arb signals for the same venue pair (0 = unlimited)")
         ("max-age-ms",    po::value<std::int64_t>()->default_value(5000),
-                          "Max book age difference ms for cross-venue staleness guard")
+                          "Max individual book age and max book-age diff ms for cross-venue staleness guard")
+        ("max-price-deviation-pct", po::value<double>()->default_value(0.0),
+                          "B5: skip venues whose best_bid deviates more than N% from median (0=disabled)")
+        ("output-max-mb", po::value<std::size_t>()->default_value(0),
+                          "D3: rotate arb output file after N MB (0=no rotation)")
+        ("watchdog-no-cross-sec", po::value<std::int64_t>()->default_value(0),
+                          "D4: log WARN if no arb cross detected in this many seconds (0=disabled)")
         ("depth",         po::value<std::size_t>()->default_value(50),
                           "OrderBook depth per venue");
 
@@ -60,7 +75,12 @@ inline bool parse_brain_cmdline(int argc, char **argv, BrainOptions &out) {
     out.bind          = vm["bind"].as<std::string>();
     out.port          = vm["port"].as<uint16_t>();
     out.min_spread_bps = vm["min-spread-bps"].as<double>();
+    out.max_spread_bps = vm["max-spread-bps"].as<double>();
+    out.rate_limit_ms  = vm["rate-limit-ms"].as<std::int64_t>();
     out.max_age_ms    = vm["max-age-ms"].as<std::int64_t>();
+    out.max_price_deviation_pct = vm["max-price-deviation-pct"].as<double>();
+    out.output_max_mb = vm["output-max-mb"].as<std::size_t>();
+    out.watchdog_no_cross_sec = vm["watchdog-no-cross-sec"].as<std::int64_t>();
     out.depth         = vm["depth"].as<std::size_t>();
     if (vm.count("certfile")) out.certfile = vm["certfile"].as<std::string>();
     if (vm.count("keyfile"))  out.keyfile  = vm["keyfile"].as<std::string>();

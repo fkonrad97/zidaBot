@@ -54,6 +54,13 @@ Disabled when `--brain_ws_host` is absent.
 | `--persist_book_every_updates` | 0 | Emit a `book_state` checkpoint every N applied incremental updates (0 = disabled) |
 | `--persist_book_top` | 50 | Levels per side to include in `book_state` |
 
+### Data quality (optional)
+
+| Flag | Default | Description |
+|---|---|---|
+| `--max_msg_rate` | 0 | C2: Expected max messages/sec for this venue. A WARN is logged if the measured rate exceeds 2× this value at each heartbeat. 0 = disabled. |
+| `--validate_every` | 0 | C3: Call `OrderBook::validate()` every N applied updates; triggers a resync if sort-order or uniqueness invariants are violated. 0 = disabled. |
+
 ### Network tuning (optional)
 
 | Flag | Default | Description |
@@ -100,6 +107,8 @@ std::size_t persist_book_every_updates;
 std::size_t persist_book_top;
 int         rest_timeout_ms;              // REST snapshot timeout (default 8000 ms)
 std::size_t depthLevel;
+int         max_msg_rate_per_sec;         // C2: 0 = monitor disabled
+int         validate_every;              // C3: 0 = periodic validate disabled
 ```
 
 ### `IVenueFeedHandler` (`pop/include/abstract/FeedHandler.hpp`)
@@ -144,11 +153,14 @@ BOOTSTRAPPING          (KuCoin: HTTP bullet fetch before WS connect)
 ```
 
 **Resync triggers**
-- `OrderBookController` returns `NeedResync` (sequence gap or checksum failure)
+- `OrderBookController` returns `NeedResync` (sequence gap, checksum failure, or `validate()` failure)
+- `onSnapshot` itself returns `NeedResync` (e.g. snapshot checksum mismatch) — all call sites check the return value and call `restartSync` if needed
 - Watchdog timer fires (no WS messages for `ws_stale_after_ms`)
 - WS disconnect
 
-On any trigger, `restartSync()` resets to `DISCONNECTED` and schedules a reconnect with exponential backoff.
+On any trigger, `restartSync()` resets to `DISCONNECTED` and schedules a reconnect with **exponential backoff**: starts at 1 s, doubles on each failure, caps at 60 s, with ±25 % random jitter. The delay resets to 1 s on a successful `SYNCED` transition.
+
+**Heartbeat**: every 60 s a `[HEARTBEAT]` line is printed to stderr with `msgs_received`, `book_updates`, and `resyncs` for the current interval. If `--max_msg_rate` is set and the measured rate exceeds 2× the ceiling, a WARN is included.
 
 **Owned components**
 
@@ -199,8 +211,8 @@ struct VenueCaps {
 |---|---|---|---|
 | Binance | RestAnchored | No | Standard REST+WS bridge |
 | OKX | RestAnchored | No | |
-| Bybit | RestAnchored | No | |
-| Bitget | RestAnchored | CRC-32 (top-25) | |
+| Bybit | RestAnchored | No | Spot WS only supports depths 1 / 50 / 200; `--depthLevel` is capped automatically |
+| Bitget | RestAnchored | No (disabled) | CRC-32 disabled: WS snapshot has no verified baseline and seq gap makes incremental CRC invalid. `allow_seq_gap=true`. Re-enable if REST snapshot is used as baseline. |
 | KuCoin | WsAuthoritative | No | HTTP bullet bootstrap required; `allow_seq_gap=true` |
 
 ---
@@ -210,13 +222,15 @@ struct VenueCaps {
 Writes normalized events as JSONL, optionally GZIP-compressed (`.gz` extension).
 
 ```cpp
-FilePersistSink(path, venue, symbol);
+FilePersistSink(path, venue, symbol, max_file_bytes = 0);
 void write_snapshot  (snap, source);
 void write_incremental(inc, source);
 void write_book_state(book, applied_seq, top_n, source, ts_book_ns);
 ```
 
 `persist_seq_` is an independent monotonic counter; it is not shared with `WsPublishSink`. Each record includes `persist_seq`, `ts_persist_ns`, `venue`, and `symbol`. See [PERSISTENCE_SCHEMA.md](PERSISTENCE_SCHEMA.md) for the full schema.
+
+**File rotation**: when `max_file_bytes > 0`, the sink tracks bytes written and rotates when the limit is reached. The current file is renamed to `<path>.1` (shifting existing `.1` → `.2`, etc.) and a fresh file is opened. For `.gz` files, rotation happens at the compressed-byte boundary (the gzip stream is flushed and closed cleanly before rename).
 
 ---
 

@@ -193,14 +193,36 @@ namespace md {
 
         boost::asio::steady_timer reconnect_timer_; ///< delayed reconnect/backoff timer
         boost::asio::steady_timer ws_watchdog_timer_; ///< detects silent stale sockets
+        boost::asio::steady_timer heartbeat_timer_; ///< periodic stats heartbeat
         std::uint64_t reconnect_gen_{0}; ///< invalidates old reconnect callbacks
         std::uint64_t ws_watchdog_gen_{0}; ///< invalidates old watchdog callbacks
         bool reconnect_scheduled_{false};
+
+        // B6: exponential reconnect backoff state
+        int reconnect_delay_ms_{1000}; ///< current backoff delay; doubles on each failure, capped at 60 s
+        static constexpr int kReconnectInitMs = 1'000;
+        static constexpr int kReconnectMaxMs  = 60'000;
+        /// Returns current delay with ±25 % jitter then doubles for next call.
+        std::chrono::milliseconds next_reconnect_delay_() noexcept;
+        /// Resets backoff to initial value (called on successful SYNCED transition).
+        void reset_reconnect_delay_() noexcept;
         bool closing_for_restart_{false}; ///< suppresses duplicate restart on self-initiated close
         bool ws_watchdog_announced_{false};
         std::int64_t last_ws_message_ns_{0}; ///< last raw websocket frame receive time
         std::size_t persist_book_every_updates_{0};
         std::size_t persist_book_top_{0};
         std::size_t updates_since_book_persist_{0};
+
+        // B6 / C4: REST request timing
+        std::int64_t rest_request_start_ns_{0}; ///< when requestSnapshot() was last called
+
+        // D2: per-feed counters
+        std::uint64_t ctr_msgs_received_{0};   ///< raw WS frames received since last heartbeat
+        std::uint64_t ctr_resyncs_{0};         ///< total restartSync() calls
+        std::uint64_t ctr_book_updates_{0};    ///< total applied incremental updates
+        std::uint64_t ctr_outbox_drops_{0};    ///< WsPublishSink outbox overflow drops (approximation)
+
+        void arm_heartbeat_();
+        void emit_heartbeat_();
     };
 }

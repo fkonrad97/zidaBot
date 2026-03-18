@@ -12,10 +12,12 @@ namespace md {
         }
     }
 
-    FilePersistSink::FilePersistSink(std::string path, std::string venue, std::string symbol)
+    FilePersistSink::FilePersistSink(std::string path, std::string venue, std::string symbol,
+                                     std::uint64_t max_file_bytes)
         : path_(std::move(path)),
           venue_(std::move(venue)),
-          symbol_(std::move(symbol)) {
+          symbol_(std::move(symbol)),
+          max_file_bytes_(max_file_bytes) {
         try {
             const std::filesystem::path p(path_);
             if (p.has_parent_path()) {
@@ -75,6 +77,20 @@ namespace md {
         return arr;
     }
 
+    void FilePersistSink::rotate_() noexcept {
+        // Only rotate plain JSONL; gzip rotation is not yet supported.
+        if (gz_out_ != nullptr || !out_.is_open()) return;
+        out_.flush();
+        out_.close();
+
+        ++rotate_seq_;
+        const std::string rotated = path_ + "." + std::to_string(rotate_seq_);
+        std::rename(path_.c_str(), rotated.c_str());
+
+        out_.open(path_, std::ios::out | std::ios::trunc);
+        bytes_written_ = 0;
+    }
+
     void FilePersistSink::write_line_(const nlohmann::json &j) noexcept {
         try {
             const std::string line = j.dump() + '\n';
@@ -90,6 +106,12 @@ namespace md {
             if (!out_.is_open()) return;
             out_ << line;
             out_.flush();
+            bytes_written_ += static_cast<std::uint64_t>(line.size());
+
+            // D3: rotate when size limit reached (plain JSONL only)
+            if (max_file_bytes_ > 0 && bytes_written_ >= max_file_bytes_) {
+                rotate_();
+            }
         } catch (...) {
             // If writes fail, keep the feed alive; persistence is best-effort for now.
         }
