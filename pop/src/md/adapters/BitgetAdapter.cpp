@@ -4,6 +4,7 @@
 #include "md/VenueAdapter.hpp"
 #include "orderbook/OrderBookUtils.hpp"
 #include "utils/DebugConfigUtils.hpp"
+#include <spdlog/spdlog.h>
 
 using json = nlohmann::json;
 
@@ -106,7 +107,7 @@ namespace md {
         json j = json::parse(msg.begin(), msg.end(), nullptr, false);
         if (j.is_discarded()) {
             if (debug::dbg_on()) {
-                std::cerr << "[BITGET][SNAPSHOT] json parse failed\n";
+                spdlog::debug("[BITGET][SNAPSHOT] json parse failed");
                 debug::dbg_raw(msg);
             }
             return false;
@@ -142,14 +143,9 @@ namespace md {
             static std::uint64_t snap_cnt = 0;
             // snapshot is rare; log always or sample—your choice:
             ++snap_cnt;
-            std::cerr << "[BITGET][SNAPSHOT#" << snap_cnt << "] "
-                    << "seqId=" << out.lastUpdateId
-                    << " bids=" << out.bids.size()
-                    << " asks=" << out.asks.size();
-            if (md::debug::show_checksum.load(std::memory_order_relaxed)) {
-                std::cerr << " checksum=" << out.checksum;
-            }
-            std::cerr << "\n";
+            spdlog::debug("[BITGET][SNAPSHOT#{}] seqId={} bids={} asks={} checksum={}",
+                snap_cnt, out.lastUpdateId, out.bids.size(), out.asks.size(),
+                (md::debug::show_checksum.load(std::memory_order_relaxed) ? std::to_string(out.checksum) : ""));
             debug::dbg_levels("bid", out.bids);
             debug::dbg_levels("ask", out.asks);
             debug::dbg_raw(msg);
@@ -164,7 +160,7 @@ namespace md {
         json j = json::parse(msg.begin(), msg.end(), nullptr, false);
         if (j.is_discarded()) {
             if (debug::dbg_on()) {
-                std::cerr << "[BITGET][INC] json parse failed\n";
+                spdlog::debug("[BITGET][INC] json parse failed");
                 debug::dbg_raw(msg);
             }
             return false;
@@ -200,18 +196,12 @@ namespace md {
         if (debug::dbg_on()) {
             static std::uint64_t inc_cnt = 0;
             if (debug::dbg_sample(inc_cnt)) {
-                std::cerr << "[BITGET][INC#" << inc_cnt << "] ";
-                if (md::debug::show_seq.load(std::memory_order_relaxed)) {
-                    std::cerr << "prev=" << out.prev_last
-                            << " first=" << out.first_seq
-                            << " last=" << out.last_seq << " ";
-                }
-                std::cerr << "b=" << out.bids.size()
-                        << " a=" << out.asks.size();
-                if (md::debug::show_checksum.load(std::memory_order_relaxed)) {
-                    std::cerr << " checksum=" << out.checksum;
-                }
-                std::cerr << "\n";
+                spdlog::debug("[BITGET][INC#{}] {}b={} a={} checksum={}",
+                    inc_cnt,
+                    (md::debug::show_seq.load(std::memory_order_relaxed) ?
+                        std::string("prev=") + std::to_string(out.prev_last) + " first=" + std::to_string(out.first_seq) + " last=" + std::to_string(out.last_seq) + " " : ""),
+                    out.bids.size(), out.asks.size(),
+                    (md::debug::show_checksum.load(std::memory_order_relaxed) ? std::to_string(out.checksum) : ""));
                 debug::dbg_raw(msg);
             }
         }

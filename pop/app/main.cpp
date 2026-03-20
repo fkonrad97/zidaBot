@@ -7,14 +7,16 @@
 #include <boost/beast/http/fields.hpp>     // IMPORTANT: this is where your error originates
 #include <boost/beast/websocket.hpp>
 
+#include <iostream>
+#include <spdlog/spdlog.h>
+
 #include "CmdLine.hpp"
 #include "abstract/FeedHandler.hpp"
 #include "md/GenericFeedHandler.hpp"
-#include "utils/ProcessLoggingUtils.hpp"
+#include "utils/Log.hpp"
 #include "utils/VenueUtils.hpp"
 #include <chrono>
 #include <functional>
-#include <iostream>
 #include <memory>
 #include <string>
 #include "utils/DebugConfigUtils.hpp"
@@ -56,14 +58,12 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    std::optional<md::logging::ProcessLogSession> log_session;
-    if (options.log_path && !options.log_path->empty()) {
-        log_session = md::logging::enable_process_file_logging(*options.log_path);
-        if (!log_session) {
-            std::cerr << "Error: failed to open log file for base path " << *options.log_path << "\n";
-            return 1;
-        }
-        std::cerr << "[MAIN] file logging enabled path=" << log_session->path << "\n";
+    // D1: initialise structured logger (stderr always; file if --log_path given)
+    try {
+        md::log::init(options.log_level, options.log_path.value_or(""));
+    } catch (const std::exception &e) {
+        std::cerr << "Error: failed to open log file: " << e.what() << "\n";
+        return 1;
     }
 
     // ---------------------------------------------------------------------
@@ -71,8 +71,8 @@ int main(int argc, char **argv) {
     // ---------------------------------------------------------------------
     md::VenueId venue = parse_venue(options.venue);
     if (venue == md::VenueId::UNKNOWN) {
-        std::cerr << "Error: unknown venue '" << options.venue
-                << "'. Expected one of: binance, okx, bybit, bitget, kucoin.\n";
+        spdlog::error("unknown venue '{}'. Expected one of: binance, okx, bybit, bitget, kucoin.",
+                      options.venue);
         return 1;
     }
 
@@ -99,12 +99,15 @@ int main(int argc, char **argv) {
     cfg.brain_ws_port = options.brain_ws_port.value_or("");
     cfg.brain_ws_path = options.brain_ws_path.value_or("");
     cfg.brain_ws_insecure = options.brain_ws_insecure;
+    cfg.brain_ws_certfile = options.brain_ws_certfile.value_or("");
+    cfg.brain_ws_keyfile  = options.brain_ws_keyfile.value_or("");
     cfg.persist_path = options.persist_path.value_or("");
     cfg.persist_book_every_updates = static_cast<std::size_t>(options.persist_book_every_updates);
     cfg.persist_book_top = static_cast<std::size_t>(options.persist_book_top);
     cfg.rest_timeout_ms = options.rest_timeout_ms;
     cfg.max_msg_rate_per_sec = options.max_msg_rate_per_sec;
     cfg.validate_every = options.validate_every;
+    cfg.require_checksum = options.require_checksum;
 
     // Brain WS defaults (only when enabled).
     if (!cfg.brain_ws_host.empty()) {
@@ -134,7 +137,7 @@ int main(int argc, char **argv) {
         if (cfg.venue_name == md::VenueId::BINANCE) {
             cfg.symbol = make_binance_ws_topic(options, cfg, ws_sym);
         } else {
-            // for other venues you’ll likely use ws_sym directly or build a venue-specific topic
+            // for other venues you'll likely use ws_sym directly or build a venue-specific topic
             cfg.symbol = ws_sym;
         }
     } else {
@@ -144,27 +147,26 @@ int main(int argc, char **argv) {
     }
 
     // ---------------------------------------------------------------------
-    // 4) Debug output
+    // 4) Startup log
     // ---------------------------------------------------------------------
-    std::cerr << "[POP] Starting feed\n"
-            << "  venue      = " << options.venue << "\n"
-            << "  base/quote = " << cfg.base_ccy << "/" << cfg.quote_ccy << "\n"
-            << "  depthLevel = " << cfg.depthLevel << "\n"
-            << "  ws_sym     = " << ws_sym << "\n"
-            << "  rest_sym   = " << rest_sym << "\n"
-            << "  cfg.symbol = " << cfg.symbol << "\n"
-            << "  ws_host    = " << (cfg.ws_host.empty() ? "<default>" : cfg.ws_host) << "\n"
-            << "  ws_port    = " << (cfg.ws_port.empty() ? "<default>" : cfg.ws_port) << "\n"
-            << "  ws_path    = " << (cfg.ws_path.empty() ? "<default>" : cfg.ws_path) << "\n"
-            << "  rest_host  = " << (cfg.rest_host.empty() ? "<default>" : cfg.rest_host) << "\n"
-            << "  rest_port  = " << (cfg.rest_port.empty() ? "<default>" : cfg.rest_port) << "\n"
-            << "  rest_path  = " << (cfg.rest_path.empty() ? "<default>" : cfg.rest_path) << "\n"
-            << "  brain_ws  = "
-            << (cfg.brain_ws_host.empty() ? "<disabled>" : (cfg.brain_ws_host + ":" + cfg.brain_ws_port + cfg.brain_ws_path))
-            << "\n"
-            << "  persist    = " << (cfg.persist_path.empty() ? "<disabled>" : cfg.persist_path) << "\n"
-            << "  persist_book_every_updates = " << cfg.persist_book_every_updates << "\n"
-            << "  persist_book_top           = " << cfg.persist_book_top << "\n";
+    spdlog::info("[POP] Starting feed");
+    spdlog::info("  venue      = {}", options.venue);
+    spdlog::info("  base/quote = {}/{}", cfg.base_ccy, cfg.quote_ccy);
+    spdlog::info("  depthLevel = {}", cfg.depthLevel);
+    spdlog::info("  ws_sym     = {}", ws_sym);
+    spdlog::info("  rest_sym   = {}", rest_sym);
+    spdlog::info("  cfg.symbol = {}", cfg.symbol);
+    spdlog::info("  ws_host    = {}", cfg.ws_host.empty() ? "<default>" : cfg.ws_host);
+    spdlog::info("  ws_port    = {}", cfg.ws_port.empty() ? "<default>" : cfg.ws_port);
+    spdlog::info("  ws_path    = {}", cfg.ws_path.empty() ? "<default>" : cfg.ws_path);
+    spdlog::info("  rest_host  = {}", cfg.rest_host.empty() ? "<default>" : cfg.rest_host);
+    spdlog::info("  rest_port  = {}", cfg.rest_port.empty() ? "<default>" : cfg.rest_port);
+    spdlog::info("  rest_path  = {}", cfg.rest_path.empty() ? "<default>" : cfg.rest_path);
+    spdlog::info("  brain_ws   = {}", cfg.brain_ws_host.empty()
+        ? "<disabled>" : (cfg.brain_ws_host + ":" + cfg.brain_ws_port + cfg.brain_ws_path));
+    spdlog::info("  persist    = {}", cfg.persist_path.empty() ? "<disabled>" : cfg.persist_path);
+    spdlog::info("  persist_book_every_updates = {}", cfg.persist_book_every_updates);
+    spdlog::info("  persist_book_top           = {}", cfg.persist_book_top);
 
     // ---------------------------------------------------------------------
     // 5) Run
@@ -174,13 +176,14 @@ int main(int argc, char **argv) {
     auto h = std::make_unique<md::GenericFeedHandler>(ioc);
 
     auto st = h->init(cfg);
-    std::cerr << "[MAIN] init = " << (st == md::FeedOpResult::OK ? "OK" : "ERROR") << "\n";
+    spdlog::info("[MAIN] init = {}", (st == md::FeedOpResult::OK ? "OK" : "ERROR"));
     if (st != md::FeedOpResult::OK) return 1;
 
     st = h->start();
-    std::cerr << "[MAIN] start = " << (st == md::FeedOpResult::OK ? "OK" : "ERROR") << "\n";
+    spdlog::info("[MAIN] start = {}", (st == md::FeedOpResult::OK ? "OK" : "ERROR"));
     if (st != md::FeedOpResult::OK) return 2;
 
     ioc.run();
+    md::log::flush();
     return 0;
 }

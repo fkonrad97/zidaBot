@@ -1,5 +1,4 @@
 #include <csignal>
-#include <iostream>
 
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/address.hpp>
@@ -10,16 +9,21 @@
 
 #include <nlohmann/json.hpp>
 #include <openssl/ssl.h>
+#include <spdlog/spdlog.h>
 
 #include "brain/ArbDetector.hpp"
 #include "brain/BrainCmdLine.hpp"
 #include "brain/UnifiedBook.hpp"
 #include "brain/WsServer.hpp"
+#include "utils/Log.hpp"
 
 int main(int argc, char **argv) {
     brain::BrainOptions opts;
     if (!brain::parse_brain_cmdline(argc, argv, opts)) return 1;
     if (opts.show_help) return 0;
+
+    // D1: initialise structured logger before any other output
+    md::log::init(opts.log_level);
 
     // ---- TLS context ----
     boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tls_server);
@@ -37,11 +41,22 @@ int main(int argc, char **argv) {
             "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
             "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:"
             "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256");
+
+        // F1: mTLS — if a CA cert is provided, require PoP clients to present a
+        // certificate signed by that CA.  Without --ca-certfile, brain still accepts
+        // any TLS connection (backward-compatible default).
+        if (!opts.ca_certfile.empty()) {
+            ssl_ctx.load_verify_file(opts.ca_certfile);
+            ssl_ctx.set_verify_mode(
+                boost::asio::ssl::verify_peer |
+                boost::asio::ssl::verify_fail_if_no_peer_cert
+            );
+            spdlog::info("[brain] mTLS enabled: client cert required, CA={}", opts.ca_certfile);
+        }
     } catch (const std::exception &e) {
-        std::cerr << "[brain] TLS setup error: " << e.what() << "\n";
+        spdlog::error("[brain] TLS setup error: {}", e.what());
         return 1;
     }
-    // Brain does not verify client certificates (PoP doesn't present one)
 
     // ---- Core components ----
     boost::asio::io_context ioc;
@@ -68,7 +83,7 @@ int main(int argc, char **argv) {
             if (!updated.empty() && book.synced_count() >= 2)
                 arb.scan(book.venues());
         } catch (const nlohmann::json::exception &e) {
-            std::cerr << "[brain] JSON parse error: " << e.what() << "\n";
+            spdlog::warn("[brain] JSON parse error: {}", e.what());
         } catch (...) {}
     };
 
@@ -94,9 +109,9 @@ int main(int argc, char **argv) {
 
             const std::size_t synced = book.synced_count();
             if (synced == 0) {
-                std::cerr << "[brain] WATCHDOG: WARNING — no synced venues (synced_count=0)\n";
+                spdlog::warn("[brain] WATCHDOG: no synced venues (synced_count=0)");
             } else if (synced == 1) {
-                std::cerr << "[brain] WATCHDOG: INFO — only 1 synced venue, arb scan suspended\n";
+                spdlog::info("[brain] WATCHDOG: only 1 synced venue, arb scan suspended");
             }
 
             if (watchdog_no_cross_ns > 0 && synced >= 2) {
@@ -105,9 +120,8 @@ int main(int argc, char **argv) {
                     const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::system_clock::now().time_since_epoch()).count();
                     if (now - last > watchdog_no_cross_ns) {
-                        std::cerr << "[brain] WATCHDOG: WARNING — no arb cross in "
-                                  << (now - last) / 1'000'000'000LL << "s"
-                                  << " (threshold=" << opts.watchdog_no_cross_sec << "s)\n";
+                        spdlog::warn("[brain] WATCHDOG: no arb cross in {}s (threshold={}s)",
+                                     (now - last) / 1'000'000'000LL, opts.watchdog_no_cross_sec);
                     }
                 }
             }
@@ -120,28 +134,25 @@ int main(int argc, char **argv) {
     // ---- Signal handling ----
     boost::asio::signal_set signals(ioc, SIGINT, SIGTERM);
     signals.async_wait([&](const boost::system::error_code &, int) {
-        std::cerr << "[brain] shutting down\n";
+        spdlog::info("[brain] shutting down");
         watchdog_timer.cancel();
         arb.flush();
         server.stop();
         ioc.stop();
+        md::log::flush();
     });
 
-    std::cerr << "[brain] running"
-              << " depth=" << opts.depth
-              << " min_spread=" << opts.min_spread_bps << "bps"
-              << " max_spread=" << (opts.max_spread_bps > 0.0
-                    ? std::to_string(opts.max_spread_bps) + "bps" : "no-cap")
-              << " rate_limit=" << (opts.rate_limit_ms > 0
-                    ? std::to_string(opts.rate_limit_ms) + "ms" : "off")
-              << " max_age=" << opts.max_age_ms << "ms"
-              << " max_price_dev=" << (opts.max_price_deviation_pct > 0.0
-                    ? std::to_string(opts.max_price_deviation_pct) + "%" : "off")
-              << " output_max=" << (opts.output_max_mb > 0
-                    ? std::to_string(opts.output_max_mb) + "MB" : "no-rotation")
-              << " watchdog_no_cross=" << (opts.watchdog_no_cross_sec > 0
-                    ? std::to_string(opts.watchdog_no_cross_sec) + "s" : "off")
-              << "\n";
+    spdlog::info("[brain] running depth={} min_spread={}bps max_spread={} rate_limit={} "
+                 "max_age={}ms max_price_dev={} output_max={} watchdog_no_cross={} mtls={}",
+        opts.depth,
+        opts.min_spread_bps,
+        opts.max_spread_bps > 0.0 ? std::to_string(opts.max_spread_bps) + "bps" : "no-cap",
+        opts.rate_limit_ms > 0 ? std::to_string(opts.rate_limit_ms) + "ms" : "off",
+        opts.max_age_ms,
+        opts.max_price_deviation_pct > 0.0 ? std::to_string(opts.max_price_deviation_pct) + "%" : "off",
+        opts.output_max_mb > 0 ? std::to_string(opts.output_max_mb) + "MB" : "no-rotation",
+        opts.watchdog_no_cross_sec > 0 ? std::to_string(opts.watchdog_no_cross_sec) + "s" : "off",
+        opts.ca_certfile.empty() ? "off" : "on");
 
     ioc.run();
     return 0;

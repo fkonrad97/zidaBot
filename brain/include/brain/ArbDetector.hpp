@@ -2,7 +2,7 @@
 
 #include <cstdint>
 #include <fstream>
-#include <iostream>
+#include <spdlog/spdlog.h>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -51,7 +51,7 @@ public:
     /// Flush the output file. Call before shutdown to prevent partial-line loss.
     void flush() noexcept {
         if (output_.is_open()) output_.flush();
-        std::cerr << "[ArbDetector] total crosses emitted: " << crosses_total_ << "\n";
+        spdlog::info("[ArbDetector] total crosses emitted: {}", crosses_total_);
     }
 
     /// D4: timestamp of the last emitted cross (0 if none yet).

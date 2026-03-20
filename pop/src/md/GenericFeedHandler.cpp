@@ -1,7 +1,7 @@
 #include "md/GenericFeedHandler.hpp"
 #include <chrono>
-#include <iostream>
 #include <random>
+#include <spdlog/spdlog.h>
 
 namespace md
 {
@@ -21,7 +21,7 @@ namespace md
         rest_->set_keep_alive(true); // strongly recommended for snapshots
         rest_->set_logger([](std::string_view s)
                           {
-            std::cerr << s << "\n"; });
+            spdlog::debug("{}", s); });
     }
 
     std::string GenericFeedHandler::makeConnectId() const
@@ -64,15 +64,13 @@ namespace md
     {
         if (state_ == next)
             return;
-        std::cerr << "[GenericFeedHandler] state "
-                  << sync_state_to_string_(state_)
-                  << " -> " << sync_state_to_string_(next)
-                  << " venue=" << to_string(rt_.venue);
-        if (!reason.empty())
-        {
-            std::cerr << " reason=" << reason;
+        if (reason.empty()) {
+            spdlog::info("[GFH] state {} -> {} venue={}",
+                         sync_state_to_string_(state_), sync_state_to_string_(next), to_string(rt_.venue));
+        } else {
+            spdlog::info("[GFH] state {} -> {} venue={} reason={}",
+                         sync_state_to_string_(state_), sync_state_to_string_(next), to_string(rt_.venue), reason);
         }
-        std::cerr << "\n";
         state_ = next;
 
         // B6: reset reconnect backoff once we successfully reach SYNCED
@@ -151,18 +149,23 @@ namespace md
 
         controller_ = std::make_unique<OrderBookController>(rt_.depth);
         controller_->configureChecksum(rt_.caps.checksum_fn, rt_.caps.checksum_top_n);
+        controller_->setHasChecksum(rt_.caps.has_checksum);
+        if (cfg_.require_checksum) {
+            controller_->setRequireChecksum(true);
+            spdlog::info("[GFH] require_checksum=true has_checksum={}", rt_.caps.has_checksum);
+        }
         // KuCoin and a few other venues may emit non-contiguous sequence numbers
         // especially when using partial REST snapshots.  Allow controller to
         // tolerate gaps if requested by the adapter via VenueCaps.
         controller_->setAllowSequenceGap(rt_.caps.allow_seq_gap);
         if (rt_.caps.allow_seq_gap)
         {
-            std::cerr << "[GenericFeedHandler] ALLOW_SEQ_GAP enabled for venue\n";
+            spdlog::info("[GFH] ALLOW_SEQ_GAP enabled for venue");
         }
         // C3: optional periodic book validation
         if (cfg_.validate_every > 0) {
             controller_->setValidatePeriod(static_cast<std::size_t>(cfg_.validate_every));
-            std::cerr << "[GenericFeedHandler] validate_every=" << cfg_.validate_every << "\n";
+            spdlog::info("[GFH] validate_every={}", cfg_.validate_every);
         }
 
         persist_.reset();
@@ -175,12 +178,12 @@ namespace md
             persist_ = std::make_unique<FilePersistSink>(cfg_.persist_path, to_string(rt_.venue), cfg_.symbol);
             if (!persist_->is_open())
             {
-                std::cerr << "[GenericFeedHandler] WARN: failed to open persistence sink at " << cfg_.persist_path << "\n";
+                spdlog::warn("[GFH] failed to open persistence sink at {}", cfg_.persist_path);
                 persist_.reset();
             }
             else
             {
-                std::cerr << "[GenericFeedHandler] persistence enabled: " << cfg_.persist_path << "\n";
+                spdlog::info("[GFH] persistence enabled: {}", cfg_.persist_path);
                 // cadence already populated above
             }
         }
@@ -197,8 +200,10 @@ namespace md
                                                             path,
                                                             cfg_.brain_ws_insecure,
                                                             to_string(rt_.venue),
-                                                            cfg_.symbol);
-            std::cerr << "[GenericFeedHandler] brain publish enabled: " << host << ":" << port << path << "\n";
+                                                            cfg_.symbol,
+                                                            cfg_.brain_ws_certfile,
+                                                            cfg_.brain_ws_keyfile);
+            spdlog::info("[GFH] brain publish enabled: {}:{}{}", host, port, path);
         }
 
         buffer_.clear();
@@ -295,14 +300,9 @@ namespace md
         {
             ws_->set_idle_ping(std::chrono::milliseconds(0));
         }
-        std::cerr << "[GenericFeedHandler] connecting websocket"
-                  << " venue=" << to_string(rt_.venue)
-                  << " host=" << rt_.ws.host
-                  << " port=" << rt_.ws.port
-                  << " target=" << rt_.ws.target
-                  << " ping_interval_ms=" << rt_.ws_ping_interval_ms
-                  << " stale_after_ms=" << rt_.ws_stale_after_ms
-                  << "\n";
+        spdlog::info("[GFH] connecting websocket venue={} host={} port={} target={} ping_interval_ms={} stale_after_ms={}",
+                     to_string(rt_.venue), rt_.ws.host, rt_.ws.port, rt_.ws.target,
+                     rt_.ws_ping_interval_ms, rt_.ws_stale_after_ms);
         ws_->connect(rt_.ws.host, rt_.ws.port, rt_.ws.target);
     }
 
@@ -317,36 +317,26 @@ namespace md
         last_ws_message_ns_ = now_ns_();
         arm_ws_watchdog_();
 
-        std::cerr << "[GenericFeedHandler] websocket connected"
-                  << " venue=" << to_string(rt_.venue)
-                  << " host=" << rt_.ws.host
-                  << " port=" << rt_.ws.port
-                  << " target=" << rt_.ws.target
-                  << "\n";
+        spdlog::info("[GFH] websocket connected venue={} host={} port={} target={}",
+                     to_string(rt_.venue), rt_.ws.host, rt_.ws.port, rt_.ws.target);
 
         if (!rt_.wsSubscribeFrame.empty())
         {
-            std::cerr << "[GenericFeedHandler] sending ws subscribe"
-                      << " venue=" << to_string(rt_.venue)
-                      << " payload_bytes=" << rt_.wsSubscribeFrame.size()
-                      << "\n";
+            spdlog::info("[GFH] sending ws subscribe venue={} payload_bytes={}",
+                         to_string(rt_.venue), rt_.wsSubscribeFrame.size());
             ws_->send_text(rt_.wsSubscribeFrame);
         }
 
         if (rt_.caps.sync_mode == SyncMode::RestAnchored)
         {
             set_state_(FeedSyncState::WAIT_REST_SNAPSHOT, "ws_open_rest_anchored");
-            std::cerr << "[GenericFeedHandler] requesting REST snapshot"
-                      << " venue=" << to_string(rt_.venue)
-                      << "\n";
+            spdlog::info("[GFH] requesting REST snapshot venue={}", to_string(rt_.venue));
             requestSnapshot();
         }
         else
         {
             set_state_(FeedSyncState::WAIT_WS_SNAPSHOT, "ws_open_ws_authoritative");
-            std::cerr << "[GenericFeedHandler] waiting for WS snapshot"
-                      << " venue=" << to_string(rt_.venue)
-                      << "\n";
+            spdlog::info("[GFH] waiting for WS snapshot venue={}", to_string(rt_.venue));
         }
     }
 
@@ -356,12 +346,8 @@ namespace md
     void GenericFeedHandler::requestSnapshot()
     {
         set_state_(FeedSyncState::WAIT_REST_SNAPSHOT, "request_snapshot");
-        std::cerr << "[GenericFeedHandler] requesting REST snapshot"
-                  << " venue=" << to_string(rt_.venue)
-                  << " host=" << rt_.rest.host
-                  << " port=" << rt_.rest.port
-                  << " target=" << rt_.restSnapshotTarget
-                  << "\n";
+        spdlog::info("[GFH] requesting REST snapshot venue={} host={} port={} target={}",
+                     to_string(rt_.venue), rt_.rest.host, rt_.rest.port, rt_.restSnapshotTarget);
 
         rest_request_start_ns_ = now_ns_(); // C4: track REST request latency
 
@@ -382,11 +368,8 @@ namespace md
 
                              if (status == 429 || status == 418)
                              {
-                                 std::cerr << "[GenericFeedHandler] REST snapshot rate limited"
-                                           << " venue=" << to_string(rt_.venue)
-                                           << " status=" << status
-                                           << " retry_ms=750"
-                                           << "\n";
+                                 spdlog::warn("[GFH] REST snapshot rate limited venue={} status={} retry_ms=750",
+                                              to_string(rt_.venue), status);
                                  /// Rate-limited / temporary ban -> do NOT hammer.
                                  /// Simple fixed delay; replace with exponential backoff later.
                                  reconnect_timer_.expires_after(std::chrono::milliseconds(750));
@@ -419,18 +402,14 @@ namespace md
         {
             const std::int64_t rest_latency_ms = (recv_ts_ns - rest_request_start_ns_) / 1'000'000LL;
             const std::size_t buffered = buffer_.size();
-            std::cerr << "[GenericFeedHandler] received REST snapshot response"
-                      << " venue=" << to_string(rt_.venue)
-                      << " body_bytes=" << body.size()
-                      << " rest_latency_ms=" << rest_latency_ms
-                      << " buffered_incrementals=" << buffered;
+            spdlog::info("[GFH] received REST snapshot venue={} body_bytes={} rest_latency_ms={} buffered_incrementals={}",
+                         to_string(rt_.venue), body.size(), rest_latency_ms, buffered);
             if (rest_latency_ms > static_cast<std::int64_t>(cfg_.rest_timeout_ms) * 80 / 100) {
-                std::cerr << " [WARN: REST near timeout]";
+                spdlog::warn("[GFH] REST snapshot near timeout venue={} latency_ms={}", to_string(rt_.venue), rest_latency_ms);
             }
             if (buffered > max_buffer_ / 2) {
-                std::cerr << " [WARN: buffer half-full, snapshot may be very stale]";
+                spdlog::warn("[GFH] REST snapshot buffer half-full, snapshot may be very stale venue={}", to_string(rt_.venue));
             }
-            std::cerr << "\n";
         }
 
         GenericSnapshotFormat snap;
@@ -467,12 +446,12 @@ namespace md
 
         if (controller_->isSynced())
         {
-            std::cerr << "[GenericFeedHandler] bridged (post-snapshot drain) -> SYNCED\n";
+            spdlog::info("[GFH] bridged (post-snapshot drain) -> SYNCED");
             set_state_(FeedSyncState::SYNCED, "post_snapshot_bridge_complete");
         }
         else
         {
-            std::cerr << "[GenericFeedHandler] still WAIT_BRIDGE after drain\n";
+            spdlog::debug("[GFH] still WAIT_BRIDGE after drain");
         }
     }
 
@@ -628,7 +607,7 @@ namespace md
                 drainBufferedIncrementals();
                 if (controller_->isSynced())
                 {
-                    std::cerr << "[GenericFeedHandler] bridged (ws buffered path) -> SYNCED\n";
+                    spdlog::info("[GFH] bridged (ws buffered path) -> SYNCED");
                     set_state_(FeedSyncState::SYNCED, "ws_buffered_bridge_complete");
                 }
                 return;
@@ -657,7 +636,7 @@ namespace md
 
             if (state_ == FeedSyncState::WAIT_BRIDGE && controller_->isSynced())
             {
-                std::cerr << "[GenericFeedHandler] bridged (ws path) -> SYNCED\n";
+                spdlog::info("[GFH] bridged (ws path) -> SYNCED");
                 set_state_(FeedSyncState::SYNCED, "steady_state_bridge_complete");
             }
             return;
@@ -673,14 +652,13 @@ namespace md
             return;
 
         ++ctr_resyncs_;
-        std::cerr << "[GenericFeedHandler] restart sync"
-                  << " venue=" << to_string(rt_.venue)
-                  << " state=" << sync_state_to_string_(state_);
-        if (!reason.empty())
-        {
-            std::cerr << " reason=" << reason;
+        if (reason.empty()) {
+            spdlog::warn("[GFH] restart sync venue={} state={}",
+                         to_string(rt_.venue), sync_state_to_string_(state_));
+        } else {
+            spdlog::warn("[GFH] restart sync venue={} state={} reason={}",
+                         to_string(rt_.venue), sync_state_to_string_(state_), reason);
         }
-        std::cerr << "\n";
 
         disarm_ws_watchdog_();
         buffer_.clear();
@@ -710,7 +688,7 @@ namespace md
         if (target.empty())
         {
             // caps say we require bootstrap but adapter can't provide it -> hard fail
-            std::cerr << "[GenericFeedHandler] ERROR: venue requires WS bootstrap but adapter did not provide target\n";
+            spdlog::error("[GFH] venue requires WS bootstrap but adapter did not provide target");
             restartSync("bootstrap_missing_target");
             return;
         }
@@ -718,13 +696,8 @@ namespace md
         const std::string body = std::visit([&](auto const &a)
                                             { return a.wsBootstrapBody(cfg_); }, adapter_);
 
-        std::cerr << "[GenericFeedHandler] requesting ws bootstrap"
-                  << " venue=" << to_string(rt_.venue)
-                  << " host=" << rt_.rest.host
-                  << " port=" << rt_.rest.port
-                  << " target=" << target
-                  << " body_bytes=" << body.size()
-                  << "\n";
+        spdlog::info("[GFH] requesting ws bootstrap venue={} host={} port={} target={} body_bytes={}",
+                     to_string(rt_.venue), rt_.rest.host, rt_.rest.port, target, body.size());
 
         // POST bullet-public
         rest_->async_post(rt_.rest.host, rt_.rest.port, target, body,
@@ -746,14 +719,9 @@ namespace md
                                   return;
                               }
 
-                              std::cerr << "[GenericFeedHandler] ws bootstrap resolved"
-                                        << " venue=" << to_string(rt_.venue)
-                                        << " host=" << info.ws.host
-                                        << " port=" << info.ws.port
-                                        << " target=" << info.ws.target
-                                        << " ping_interval_ms=" << info.ping_interval_ms
-                                        << " ping_timeout_ms=" << info.ping_timeout_ms
-                                        << "\n";
+                              spdlog::info("[GFH] ws bootstrap resolved venue={} host={} port={} target={} ping_interval_ms={} ping_timeout_ms={}",
+                                           to_string(rt_.venue), info.ws.host, info.ws.port, info.ws.target,
+                                           info.ping_interval_ms, info.ping_timeout_ms);
 
                               // overwrite resolved WS endpoint from bootstrap
                               rt_.ws = info.ws;
@@ -785,11 +753,9 @@ namespace md
         ++reconnect_gen_;
         const auto my_gen = reconnect_gen_;
 
-        std::cerr << "[GenericFeedHandler] scheduling reconnect"
-                  << " venue=" << to_string(rt_.venue)
-                  << " delay_ms=" << delay.count()
-                  << " next_mode=" << (rt_.caps.requires_ws_bootstrap ? "bootstrap" : "connect")
-                  << "\n";
+        spdlog::info("[GFH] scheduling reconnect venue={} delay_ms={} next_mode={}",
+                     to_string(rt_.venue), delay.count(),
+                     (rt_.caps.requires_ws_bootstrap ? "bootstrap" : "connect"));
 
         reconnect_scheduled_ = true;
         reconnect_timer_.expires_after(delay);
@@ -819,10 +785,8 @@ namespace md
         ++ws_watchdog_gen_;
         const auto my_gen = ws_watchdog_gen_;
         if (!ws_watchdog_announced_) {
-            std::cerr << "[GenericFeedHandler] feed watchdog active"
-                      << " venue=" << to_string(rt_.venue)
-                      << " timeout_ms=" << rt_.ws_stale_after_ms
-                      << "\n";
+            spdlog::info("[GFH] feed watchdog active venue={} timeout_ms={}",
+                         to_string(rt_.venue), rt_.ws_stale_after_ms);
             ws_watchdog_announced_ = true;
         }
         ws_watchdog_timer_.expires_after(std::chrono::milliseconds(rt_.ws_stale_after_ms));
@@ -838,11 +802,8 @@ namespace md
             const std::int64_t now = now_ns_();
             const std::int64_t age_ns = now - last_ws_message_ns_;
             if (last_ws_message_ns_ > 0 && age_ns >= static_cast<std::int64_t>(rt_.ws_stale_after_ms) * 1'000'000LL) {
-                std::cerr << "[GenericFeedHandler] stale WS feed detected, restarting sync"
-                          << " venue=" << to_string(rt_.venue)
-                          << " state=" << static_cast<int>(state_)
-                          << " silence_ms=" << (age_ns / 1'000'000LL)
-                          << "\n";
+                spdlog::warn("[GFH] stale WS feed detected, restarting sync venue={} silence_ms={}",
+                             to_string(rt_.venue), age_ns / 1'000'000LL);
                 restartSync("stale_ws_feed");
             } });
     }
@@ -940,21 +901,15 @@ namespace md
         const std::string venue = to_string(rt_.venue);
         const std::string state = sync_state_to_string_(state_);
         const std::uint64_t msgs_per_sec = ctr_msgs_received_ / kIntervalSec;
-        std::cerr << "[HEARTBEAT] venue=" << venue
-                  << " state=" << state
-                  << " msgs_received=" << ctr_msgs_received_
-                  << " msgs_per_sec=" << msgs_per_sec
-                  << " book_updates=" << ctr_book_updates_
-                  << " resyncs=" << ctr_resyncs_;
+        spdlog::info("[HEARTBEAT] venue={} state={} msgs_received={} msgs_per_sec={} book_updates={} resyncs={}",
+                     venue, state, ctr_msgs_received_, msgs_per_sec, ctr_book_updates_, ctr_resyncs_);
 
         // C2: warn if rate exceeds 2× configured ceiling
         if (cfg_.max_msg_rate_per_sec > 0 &&
             msgs_per_sec > static_cast<std::uint64_t>(cfg_.max_msg_rate_per_sec) * 2) {
-            std::cerr << " [WARN: msg rate " << msgs_per_sec
-                      << "/s exceeds 2x ceiling " << cfg_.max_msg_rate_per_sec << "/s]";
+            spdlog::warn("[HEARTBEAT] msg rate {}/s exceeds 2x ceiling {}/s venue={}",
+                         msgs_per_sec, cfg_.max_msg_rate_per_sec, venue);
         }
-
-        std::cerr << "\n";
         // Reset per-interval counters; lifetime counters (resyncs) are kept
         ctr_msgs_received_ = 0;
         ctr_book_updates_  = 0;

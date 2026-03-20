@@ -2,7 +2,7 @@
 #include "brain/JsonParsers.hpp"
 
 #include <chrono>
-#include <iostream>
+#include <spdlog/spdlog.h>
 
 namespace brain {
 
@@ -23,13 +23,13 @@ inline std::int64_t sanitize_ts(std::int64_t ts, std::string_view venue) noexcep
     constexpr std::int64_t kWarnPastNs  = 300LL * 1'000'000'000LL; // 5 min
     const std::int64_t ts_now = now_ns();
     if (ts > ts_now + kMaxFutureNs) {
-        std::cerr << "[UnifiedBook] WARNING: future ts_book_ns from venue=" << venue
-                  << " diff=+" << (ts - ts_now) / 1'000'000 << "ms — clamped to now\n";
+        spdlog::warn("[UnifiedBook] future ts_book_ns from venue={} diff=+{}ms — clamped to now",
+                     venue, (ts - ts_now) / 1'000'000);
         return ts_now;
     }
     if (ts > 0 && ts < ts_now - kWarnPastNs) {
-        std::cerr << "[UnifiedBook] WARNING: stale ts_book_ns from venue=" << venue
-                  << " age=" << (ts_now - ts) / 1'000'000 << "ms\n";
+        spdlog::warn("[UnifiedBook] stale ts_book_ns from venue={} age={}ms",
+                     venue, (ts_now - ts) / 1'000'000);
     }
     return ts;
 }
@@ -65,7 +65,7 @@ VenueBook *UnifiedBook::find_or_create_(const std::string &venue, const std::str
         if (vb.venue_name == venue && vb.symbol == symbol) return &vb;
     }
     books_.emplace_back(venue, symbol, depth_);
-    std::cerr << "[UnifiedBook] registered new venue+symbol: " << venue << ":" << symbol << "\n";
+    spdlog::info("[UnifiedBook] registered new venue+symbol: {}:{}", venue, symbol);
     return &books_.back();
 }
 
@@ -96,8 +96,8 @@ std::string UnifiedBook::on_event(const nlohmann::json &j) {
             const auto action = vb->controller->onSnapshot(
                 snap, md::OrderBookController::BaselineKind::WsAuthoritative);
             if (action == md::OrderBookController::Action::NeedResync) {
-                std::cerr << "[UnifiedBook] NeedResync after snapshot venue=" << hdr.venue
-                          << " — book cleared, awaiting next event\n";
+                spdlog::warn("[UnifiedBook] NeedResync after snapshot venue={} — book cleared, awaiting next event",
+                             hdr.venue);
                 vb->feed_healthy = false; // don't use this venue until resync succeeds
             }
 
@@ -107,8 +107,8 @@ std::string UnifiedBook::on_event(const nlohmann::json &j) {
             vb->feed_healthy = true;
             const auto action = vb->controller->onIncrement(inc);
             if (action == md::OrderBookController::Action::NeedResync)
-                std::cerr << "[UnifiedBook] NeedResync after incremental venue=" << hdr.venue
-                          << " — awaiting next book_state\n";
+                spdlog::warn("[UnifiedBook] NeedResync after incremental venue={} — awaiting next book_state",
+                             hdr.venue);
 
         } else if (hdr.event_type == "book_state") {
             vb->ts_book_ns   = sanitize_ts(extract_ts_book_ns(j), hdr.venue);
@@ -117,15 +117,15 @@ std::string UnifiedBook::on_event(const nlohmann::json &j) {
             const auto action = vb->controller->onSnapshot(
                 snap, md::OrderBookController::BaselineKind::WsAuthoritative);
             if (action == md::OrderBookController::Action::NeedResync)
-                std::cerr << "[UnifiedBook] NeedResync after book_state venue=" << hdr.venue << "\n";
+                spdlog::warn("[UnifiedBook] NeedResync after book_state venue={}", hdr.venue);
 
         } else if (hdr.event_type == "status") {
             const std::string feed_state = j.value("feed_state", "");
             const std::string reason     = j.value("reason", "");
-            std::cerr << "[UnifiedBook] status venue=" << hdr.venue
-                      << " state=" << feed_state;
-            if (!reason.empty()) std::cerr << " reason=" << reason;
-            std::cerr << "\n";
+            if (reason.empty())
+                spdlog::info("[UnifiedBook] status venue={} state={}", hdr.venue, feed_state);
+            else
+                spdlog::info("[UnifiedBook] status venue={} state={} reason={}", hdr.venue, feed_state, reason);
 
             if (feed_state == "disconnected") {
                 // PoP lost its exchange feed — book is stale; stop using it immediately.
@@ -142,11 +142,10 @@ std::string UnifiedBook::on_event(const nlohmann::json &j) {
             return {};
         }
     } catch (const std::exception &e) {
-        std::cerr << "[UnifiedBook] parse error venue=" << hdr.venue
-                  << " type=" << hdr.event_type << " err=" << e.what() << "\n";
+        spdlog::warn("[UnifiedBook] parse error venue={} type={} err={}", hdr.venue, hdr.event_type, e.what());
         return {};
     } catch (...) {
-        std::cerr << "[UnifiedBook] unknown parse error venue=" << hdr.venue << "\n";
+        spdlog::warn("[UnifiedBook] unknown parse error venue={}", hdr.venue);
         return {};
     }
 

@@ -41,7 +41,7 @@ Circuit breakers and data guards to prevent runaway signals or bad data from cau
 | B4 | Timestamp validation: reject `ts_book_ns` more than N seconds in the past or future vs. system clock | HIGH | ✅ Done | `brain/src/brain/UnifiedBook.cpp` | Future ts (>60 s) clamped to now; past ts (>5 min) logs WARN |
 | B5 | Cross-venue price sanity: if best_bid on any venue deviates > configurable % from the median across all venues, log anomaly and skip that venue in arb scan | MEDIUM | ✅ Done | `brain/src/brain/ArbDetector.cpp`, `brain/include/brain/BrainCmdLine.hpp` | `--max-price-deviation-pct` (0=disabled); median computed each scan over synced venues |
 | B6 | GenericFeedHandler reconnect: exponential backoff (start 1 s, max 60 s) with ±25% jitter; currently fixed 200 ms | MEDIUM | ✅ Done | `pop/src/md/GenericFeedHandler.cpp`, `pop/include/md/GenericFeedHandler.hpp` | Resets to 1 s on successful SYNCED transition |
-| B7 | Quantity sanity: reject or warn on levels with `quantityLot == 0` that arrive in snapshot (not just incremental remove) | LOW | ⬜ Not Started | `common/include/orderbook/OrderBook.hpp` | |
+| B7 | Quantity sanity: reject or warn on levels with `quantityLot == 0` that arrive in snapshot (not just incremental remove) | LOW | ✅ Done | `common/src/orderbook/OrderBookController.cpp` | Zero-qty levels logged + skipped in `onSnapshot` before sort/apply |
 
 ---
 
@@ -55,7 +55,7 @@ Integrity checks to catch corrupted or implausible book state before it drives s
 | C2 | Per-venue update rate monitor: track messages/sec; log WARN if rate exceeds configurable ceiling (e.g. 2×expected) | MEDIUM | ✅ Done | `pop/src/md/GenericFeedHandler.cpp`, `pop/include/abstract/FeedHandler.hpp`, `pop/include/CmdLine.hpp` | `--max-msg-rate N`; rate computed at heartbeat (60 s), WARN if > 2×ceiling |
 | C3 | Periodic `OrderBook::validate()`: call every N updates in debug / staging builds to catch sort-order violations | MEDIUM | ✅ Done | `common/include/orderbook/OrderBookController.hpp`, `common/src/orderbook/OrderBookController.cpp` | `--validate-every N` (0=off); triggers `need_resync_("validate_failed")` on violation |
 | C4 | REST snapshot staleness warning: log WARN if `lastUpdateId` from REST is more than M seconds behind the live WS stream | MEDIUM | ✅ Done | `pop/src/md/GenericFeedHandler.cpp`, `pop/include/md/GenericFeedHandler.hpp` | Logs REST latency ms and buffer depth on each snapshot response |
-| C5 | Incremental checksum coverage: document which venues lack checksums; add a `--require-checksum` strict mode that triggers resync on any unverified incremental | LOW | ⬜ Not Started | venue adapters, `pop/include/md/VenueAdapter.hpp` | Only Bitget has checksums today |
+| C5 | Incremental checksum coverage: document which venues lack checksums; add a `--require-checksum` strict mode that triggers resync on any unverified incremental | LOW | ✅ Done | `common/include/orderbook/OrderBookController.hpp`, `common/src/orderbook/OrderBookController.cpp`, `pop/include/abstract/FeedHandler.hpp`, `pop/include/CmdLine.hpp`, `pop/src/md/GenericFeedHandler.cpp`, `docs/pop.md` | `setHasChecksum` + `setRequireChecksum` on controller; docs table added to `docs/pop.md`; only OKX currently active |
 
 ---
 
@@ -65,7 +65,7 @@ Needed to run the engine unattended and debug incidents.
 
 | # | Item | Priority | Status | Files | Notes |
 |---|---|---|---|---|---|
-| D1 | Structured logging: replace free-form `std::cerr` with a levelled, structured log facade (spdlog recommended); log level configurable at runtime | HIGH | ⬜ Not Started | all translation units | Large refactor — do last in track |
+| D1 | Structured logging: replace free-form `std::cerr` with a levelled, structured log facade (spdlog recommended); log level configurable at runtime | HIGH | ✅ Done | `common/include/utils/Log.hpp`, `common/src/utils/Log.cpp`, all `.cpp` translation units | spdlog v1.14.1; `--log_level` (pop) / `--log-level` (brain); stderr + optional file sink; flush_on(warn) |
 | D2 | Per-venue counters: messages received, resyncs triggered, outbox drops, crosses detected — exposed via stderr heartbeat | HIGH | ✅ Done | `pop/src/md/GenericFeedHandler.cpp`, `brain/src/brain/ArbDetector.cpp` | PoP: `[HEARTBEAT]` every 60 s with msgs/book_updates/resyncs; Brain: total crosses on `flush()` |
 | D3 | Output file rotation: size- or time-based rotation for `--output` arb JSONL and `--persist_path` files; prevents unbounded disk growth | MEDIUM | ✅ Done | `brain/src/brain/ArbDetector.cpp`, `brain/include/brain/BrainCmdLine.hpp`, `pop/src/postprocess/FilePersistSink.cpp`, `pop/include/postprocess/FilePersistSink.hpp` | `--output-max-mb N` for arb JSONL; persist sink rotates plain JSONL; .gz rotation deferred |
 | D4 | Brain watchdog: periodic timer (e.g. 60 s) that logs WARN if `synced_count() == 0` or no arb scan has fired for N seconds | MEDIUM | ✅ Done | `brain/app/brain.cpp`, `brain/include/brain/BrainCmdLine.hpp`, `brain/include/brain/ArbDetector.hpp` | `--watchdog-no-cross-sec N` (0=off); always warns when synced_count==0 |
@@ -94,12 +94,12 @@ Larger architectural changes for running at scale or in a high-availability setu
 
 | # | Item | Priority | Status | Notes |
 |---|---|---|---|---|
-| F1 | Mutual TLS (mTLS) between PoP and Brain: PoP presents client cert signed by private CA; brain verifies it | HIGH | ⬜ Not Started | prevents rogue data injection |
-| F2 | Configuration file support (YAML/TOML) with CLI overrides; eliminates long command lines for multi-venue deployments | MEDIUM | ⬜ Not Started | `toml++` or `yaml-cpp` |
+| F1 | Mutual TLS (mTLS) between PoP and Brain: PoP presents client cert signed by private CA; brain verifies it | HIGH | ✅ Done | `common/include/connection_handler/WsClient.hpp`, `common/src/connection_handler/WsClient.cpp`, `pop/include/postprocess/WsPublishSink.hpp`, `pop/src/postprocess/WsPublishSink.cpp`, `pop/include/abstract/FeedHandler.hpp`, `pop/include/CmdLine.hpp`, `pop/app/main.cpp`, `pop/src/md/GenericFeedHandler.cpp`, `brain/include/brain/BrainCmdLine.hpp`, `brain/app/brain.cpp` | `--brain_ws_certfile/keyfile` on PoP; `--ca-certfile` on brain; opt-in, backward-compatible |
+| F2 | Configuration file support (YAML/TOML) with CLI overrides; eliminates long command lines for multi-venue deployments | MEDIUM | ✅ Done | `pop/include/CmdLine.hpp`, `brain/include/brain/BrainCmdLine.hpp` | `--config FILE` (key=value format, boost `parse_config_file`); no new deps; CLI overrides file |
 | F3 | Multi-symbol support: one PoP process can track multiple symbols; `FeedHandlerConfig` becomes a symbol list | MEDIUM | ⬜ Not Started | `pop/app/main.cpp`, `pop/src/md/GenericFeedHandler.cpp` |
 | F4 | Brain active-passive failover: secondary brain subscribes to same PoPs, promotes on primary failure | LOW | ⬜ Not Started | new component |
 | F5 | Latency pipeline: histogram (p50/p95/p99) of PoP-receive → brain-detected latency per venue pair | LOW | ⬜ Not Started | `brain/src/brain/ArbDetector.cpp` |
-| F6 | Reconnect jitter: ±25% random jitter on all reconnect delays to prevent thundering herd on simultaneous restarts | LOW | ⬜ Not Started | `pop/src/md/GenericFeedHandler.cpp`, `pop/src/postprocess/WsPublishSink.cpp` |
+| F6 | Reconnect jitter: ±25% random jitter on all reconnect delays to prevent thundering herd on simultaneous restarts | LOW | ✅ Done | `pop/src/postprocess/WsPublishSink.cpp` | WsPublishSink now uses `mt19937` ±25% jitter matching GenericFeedHandler |
 
 ---
 
@@ -112,14 +112,24 @@ Larger architectural changes for running at scale or in a high-availability setu
 
 ---
 
-## Batch 3 — Planned
+## Batch 4 — ✅ Complete (2026-03-20)
+
+D1 structured logging, wiring the spdlog facade across all translation units.
+
+| # | Item | Status |
+|---|---|---|
+| D1 | Structured logging — spdlog v1.14.1, `--log_level` / `--log-level` CLI flags, cerr → spdlog in all sources | ✅ Done |
+
+---
+
+## Batch 3 — ✅ Complete (2026-03-20)
 
 Scope: close out small correctness gaps, secure the PoP→brain channel, and make the stack operator-friendly with a config file.
 
-| # | Item | Track | Priority | Description |
-|---|---|---|---|---|
-| F6 | WsPublishSink reconnect jitter | F | LOW | `GenericFeedHandler` already has ±25 % jitter; `WsPublishSink` still uses a fixed backoff. Apply the same `mt19937`-based jitter there. One-liner change. |
-| B7 | Snapshot zero-quantity sanity | B | LOW | In `OrderBookController::onSnapshot`, log a WARN and skip levels with `quantityLot == 0` (zero-qty levels in a snapshot are anomalous; in incrementals they are valid remove signals). |
-| C5 | Checksum coverage + `--require-checksum` | C | LOW | Add `--require-checksum` flag to PoP. When set, any incremental with `checksum == 0` on a venue that normally provides checksums triggers a resync. Add a table to `docs/pop.md` documenting current checksum status per venue. |
-| F1 | mTLS between PoP and Brain | F | HIGH | Brain: `set_verify_mode(verify_peer \| verify_fail_if_no_peer_cert)` + load CA cert. PoP `WsPublishSink`: load client cert + key from new CLI flags `--brain_ws_certfile` / `--brain_ws_keyfile`. Prevents rogue data injection from unauthorized senders. |
-| F2 | TOML config file support | F | MEDIUM | Add `toml++` (header-only, via FetchContent) to both `pop` and `brain`. Accept `--config <file>` flag; CLI flags override file values. Eliminates long command lines for multi-venue deployments. |
+| # | Item | Status |
+|---|---|---|
+| F6 | WsPublishSink reconnect jitter | ✅ Done |
+| B7 | Snapshot zero-quantity sanity | ✅ Done |
+| C5 | Checksum coverage + `--require_checksum` | ✅ Done |
+| F1 | mTLS between PoP and Brain | ✅ Done |
+| F2 | Config file support (`--config`, boost ini-style, CLI overrides) | ✅ Done |

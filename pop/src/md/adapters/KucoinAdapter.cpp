@@ -4,6 +4,7 @@
 #include "md/VenueAdapter.hpp"
 #include "orderbook/OrderBookUtils.hpp"
 #include "utils/DebugConfigUtils.hpp"
+#include <spdlog/spdlog.h>
 
 using json = nlohmann::json;
 
@@ -106,7 +107,7 @@ namespace md {
         json j = json::parse(body.begin(), body.end(), nullptr, false);
         if (j.is_discarded()) {
             if (debug::dbg_on()) {
-                std::cerr << "[KUCOIN][BOOTSTRAP] json parse failed\n";
+                spdlog::debug("[KUCOIN][BOOTSTRAP] json parse failed");
                 debug::dbg_raw(body);
             }
             return false;
@@ -155,12 +156,9 @@ namespace md {
         out.ping_timeout_ms = pingTimeout;
 
         if (debug::dbg_on()) {
-            std::cerr << "[KUCOIN][BOOTSTRAP] "
-                    << "host=" << out.ws.host << " port=" << out.ws.port
-                    << " target=" << out.ws.target
-                    << " pingInterval=" << out.ping_interval_ms
-                    << " pingTimeout=" << out.ping_timeout_ms
-                    << "\n";
+            spdlog::debug("[KUCOIN][BOOTSTRAP] host={} port={} target={} pingInterval={} pingTimeout={}",
+                out.ws.host, out.ws.port, out.ws.target,
+                out.ping_interval_ms, out.ping_timeout_ms);
         }
 
         return true;
@@ -244,7 +242,7 @@ namespace md {
         json j = json::parse(msg.begin(), msg.end(), nullptr, false);
         if (j.is_discarded()) {
             if (debug::dbg_on()) {
-                std::cerr << "[KUCOIN][SNAPSHOT] json parse failed\n";
+                spdlog::debug("[KUCOIN][SNAPSHOT] json parse failed");
                 debug::dbg_raw(msg);
             }
             return false;
@@ -263,14 +261,9 @@ namespace md {
         if (debug::dbg_on()) {
             static std::uint64_t snap_cnt = 0;
             ++snap_cnt;
-            std::cerr << "[KUCOIN][SNAPSHOT#" << snap_cnt << "] "
-                    << "seqId=" << out.lastUpdateId
-                    << " bids=" << out.bids.size()
-                    << " asks=" << out.asks.size();
-            if (md::debug::show_checksum.load(std::memory_order_relaxed)) {
-                std::cerr << " checksum=" << out.checksum;
-            }
-            std::cerr << "\n";
+            spdlog::debug("[KUCOIN][SNAPSHOT#{}] seqId={} bids={} asks={} checksum={}",
+                snap_cnt, out.lastUpdateId, out.bids.size(), out.asks.size(),
+                (md::debug::show_checksum.load(std::memory_order_relaxed) ? std::to_string(out.checksum) : ""));
             debug::dbg_levels("bid", out.bids);
             debug::dbg_levels("ask", out.asks);
             debug::dbg_raw(msg);
@@ -285,7 +278,7 @@ namespace md {
         json j = json::parse(msg.begin(), msg.end(), nullptr, false);
         if (j.is_discarded()) {
             if (debug::dbg_on()) {
-                std::cerr << "[KUCOIN][INC] json parse failed\n";
+                spdlog::debug("[KUCOIN][INC] json parse failed");
                 debug::dbg_raw(msg);
             }
             return false;
@@ -313,18 +306,12 @@ namespace md {
         if (debug::dbg_on()) {
             static std::uint64_t inc_cnt = 0;
             if (debug::dbg_sample(inc_cnt)) {
-                std::cerr << "[KUCOIN][INC#" << inc_cnt << "] ";
-                if (md::debug::show_seq.load(std::memory_order_relaxed)) {
-                    std::cerr << "prev=" << out.prev_last
-                            << " first=" << out.first_seq
-                            << " last=" << out.last_seq << " ";
-                }
-                std::cerr << "b=" << out.bids.size()
-                        << " a=" << out.asks.size();
-                if (md::debug::show_checksum.load(std::memory_order_relaxed)) {
-                    std::cerr << " checksum=" << out.checksum;
-                }
-                std::cerr << "\n";
+                spdlog::debug("[KUCOIN][INC#{}] {}b={} a={} checksum={}",
+                    inc_cnt,
+                    (md::debug::show_seq.load(std::memory_order_relaxed) ?
+                        std::string("prev=") + std::to_string(out.prev_last) + " first=" + std::to_string(out.first_seq) + " last=" + std::to_string(out.last_seq) + " " : ""),
+                    out.bids.size(), out.asks.size(),
+                    (md::debug::show_checksum.load(std::memory_order_relaxed) ? std::to_string(out.checksum) : ""));
                 debug::dbg_raw(msg);
             }
         }

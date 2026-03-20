@@ -2,6 +2,7 @@
 
 #include <boost/program_options.hpp>
 #include <cstdint>
+#include <fstream>
 #include <iostream>
 #include <string>
 
@@ -12,7 +13,9 @@ struct BrainOptions {
     uint16_t    port{8443};
     std::string certfile;       ///< Required: TLS cert PEM to present to PoP clients
     std::string keyfile;        ///< Required: TLS private key PEM
+    std::string ca_certfile;    ///< F1: optional CA cert for mTLS client verification
     std::string output;         ///< Optional: arb signal JSONL output file path
+    std::string log_level{"info"};  ///< D1: log verbosity: debug | info | warn | error
     double      min_spread_bps{0.0};
     double      max_spread_bps{0.0};  ///< 0 = no upper cap; >0 logs anomaly + suppresses
     std::int64_t rate_limit_ms{1000}; ///< min ms between signals for same (sell,buy) pair; 0 = off
@@ -30,6 +33,8 @@ inline bool parse_brain_cmdline(int argc, char **argv, BrainOptions &out) {
     po::options_description desc("brain");
     desc.add_options()
         ("help,h", "Show this help message")
+        ("config",        po::value<std::string>()->default_value(""),
+                          "F2: config file path (key=value per line; CLI flags override file values)")
         ("bind",          po::value<std::string>()->default_value("0.0.0.0"),
                           "Bind address")
         ("port",          po::value<uint16_t>()->default_value(8443),
@@ -38,6 +43,8 @@ inline bool parse_brain_cmdline(int argc, char **argv, BrainOptions &out) {
                           "TLS certificate PEM file")
         ("keyfile",       po::value<std::string>(),
                           "TLS private key PEM file")
+        ("ca-certfile",   po::value<std::string>(),
+                          "F1: CA certificate PEM for mTLS — require PoP clients to present a cert signed by this CA")
         ("output",        po::value<std::string>(),
                           "Arb signal output JSONL file path")
         ("min-spread-bps",po::value<double>()->default_value(0.0),
@@ -55,11 +62,26 @@ inline bool parse_brain_cmdline(int argc, char **argv, BrainOptions &out) {
         ("watchdog-no-cross-sec", po::value<std::int64_t>()->default_value(0),
                           "D4: log WARN if no arb cross detected in this many seconds (0=disabled)")
         ("depth",         po::value<std::size_t>()->default_value(50),
-                          "OrderBook depth per venue");
+                          "OrderBook depth per venue")
+        ("log-level",     po::value<std::string>()->default_value("info"),
+                          "D1: log verbosity: debug | info | warn | error");
 
     po::variables_map vm;
     try {
+        // F2: CLI first, then config file; CLI values win (first store wins).
         po::store(po::parse_command_line(argc, argv, desc), vm);
+
+        const std::string config_path = vm.count("config") ? vm["config"].as<std::string>() : "";
+        if (!config_path.empty()) {
+            std::ifstream cfg_stream(config_path);
+            if (!cfg_stream) {
+                std::cerr << "[brain] Error: cannot open config file: " << config_path << "\n";
+                return false;
+            }
+            po::store(po::parse_config_file(cfg_stream, desc, /*allow_unregistered=*/true), vm);
+            std::cerr << "[brain] config file loaded: " << config_path << "\n";
+        }
+
         po::notify(vm);
     } catch (const po::error &e) {
         std::cerr << "[brain] CLI error: " << e.what() << "\n";
@@ -82,8 +104,10 @@ inline bool parse_brain_cmdline(int argc, char **argv, BrainOptions &out) {
     out.output_max_mb = vm["output-max-mb"].as<std::size_t>();
     out.watchdog_no_cross_sec = vm["watchdog-no-cross-sec"].as<std::int64_t>();
     out.depth         = vm["depth"].as<std::size_t>();
-    if (vm.count("certfile")) out.certfile = vm["certfile"].as<std::string>();
-    if (vm.count("keyfile"))  out.keyfile  = vm["keyfile"].as<std::string>();
+    out.log_level = vm["log-level"].as<std::string>();
+    if (vm.count("certfile"))   out.certfile   = vm["certfile"].as<std::string>();
+    if (vm.count("keyfile"))    out.keyfile    = vm["keyfile"].as<std::string>();
+    if (vm.count("ca-certfile")) out.ca_certfile = vm["ca-certfile"].as<std::string>();
     if (vm.count("output"))   out.output   = vm["output"].as<std::string>();
 
     if (out.certfile.empty() || out.keyfile.empty()) {

@@ -57,6 +57,11 @@ namespace md {
     void WsClient::set_on_close(CloseHandler h) { on_close_ = std::move(h); }
     void WsClient::set_on_open(OpenHandler h) { on_open_ = std::move(h); }
 
+    void WsClient::set_client_cert(const std::string &certfile, const std::string &keyfile) {
+        ssl_ctx_.use_certificate_chain_file(certfile);
+        ssl_ctx_.use_private_key_file(keyfile, ssl::context::pem);
+    }
+
     void WsClient::connect(std::string host, std::string port, std::string target) {
         auto self = shared_from_this();
         boost::asio::dispatch(strand_, [self,
@@ -69,9 +74,16 @@ namespace md {
 
                                   boost::system::error_code ignored;
                                   self->resolver_.cancel(); // IMPORTANT: cancel any in-flight resolve
-                                  self->ws_.next_layer().shutdown(ignored);
+                                  // Hard-close TCP first, then reset the SSL state.
+                                  // Do NOT call ssl::stream::shutdown() here: it is synchronous
+                                  // and blocks the strand waiting for a TLS close_notify from
+                                  // the peer (hangs indefinitely if the peer is unreachable).
+                                  // SSL_clear() resets the SSL object to a fresh pre-handshake
+                                  // state so that do_tls_handshake_() can start cleanly on
+                                  // the same ssl::stream object.
                                   beast::get_lowest_layer(self->ws_).cancel(ignored);
                                   beast::get_lowest_layer(self->ws_).close(ignored);
+                                  SSL_clear(self->ws_.next_layer().native_handle());
 
                                   // Reset state
                                   self->closing_ = false;

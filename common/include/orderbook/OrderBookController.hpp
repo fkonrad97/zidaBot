@@ -65,6 +65,15 @@ namespace md {
         /// On a sort-order or uniqueness violation, triggers a resync.  0 = disabled.
         void setValidatePeriod(std::size_t n) noexcept { validate_period_ = n; }
 
+        /// C5: declare whether this venue normally provides per-update checksums.
+        /// Used by setRequireChecksum() to decide whether to enforce presence.
+        void setHasChecksum(bool has) noexcept { has_checksum_ = has; }
+
+        /// C5: when true, a steady-state incremental with checksum==0 on a
+        /// checksum-capable venue (has_checksum==true) triggers a resync even
+        /// if no checksum_fn is configured.  Default false.
+        void setRequireChecksum(bool require) noexcept { require_checksum_ = require; }
+
         enum class BaselineKind : std::uint8_t { RestAnchored, WsAuthoritative };
 
         enum class Action {
@@ -139,6 +148,10 @@ namespace md {
         // C3: periodic book validation
         std::size_t validate_period_{0};   ///< 0 = disabled; else validate every N updates
         std::size_t validate_counter_{0};
+
+        // C5: checksum enforcement
+        bool has_checksum_{false};    ///< venue declares it provides checksums
+        bool require_checksum_{false}; ///< user opted in to strict checksum enforcement
 
         bool validateChecksum(std::int64_t expected) const noexcept {
             if (!checksum_fn_) return true;

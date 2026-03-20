@@ -48,7 +48,9 @@ namespace md {
                       std::string target,
                       bool insecure_tls,
                       std::string venue,
-                      std::string symbol);
+                      std::string symbol,
+                      std::string client_certfile = {},
+                      std::string client_keyfile = {});
 
         void start();
         void stop();
@@ -92,6 +94,9 @@ namespace md {
         bool reconnect_scheduled_{false};
         int reconnect_delay_ms_{1000};
         std::uint64_t reconnect_gen_{0};
+
+        std::string client_certfile_;
+        std::string client_keyfile_;
 
         // Independent counter; not shared with FilePersistSink.
         // If both sinks are active, their persist_seq spaces are disjoint.

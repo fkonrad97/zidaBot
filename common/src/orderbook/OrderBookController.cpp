@@ -1,7 +1,7 @@
 #include "orderbook/OrderBookController.hpp"
 
 #include <algorithm>
-#include <iostream>
+#include <spdlog/spdlog.h>
 
 namespace md {
     const char *OrderBookController::book_sync_state_to_string_(BookSyncState state) noexcept {
@@ -15,13 +15,13 @@ namespace md {
 
     void OrderBookController::set_state_(BookSyncState next, std::string_view reason) noexcept {
         if (state_ == next) return;
-        std::cerr << "[OrderBookController] state "
-                  << book_sync_state_to_string_(state_)
-                  << " -> " << book_sync_state_to_string_(next);
-        if (!reason.empty()) {
-            std::cerr << " reason=" << reason;
+        if (reason.empty()) {
+            spdlog::info("[OBC] state {} -> {}",
+                         book_sync_state_to_string_(state_), book_sync_state_to_string_(next));
+        } else {
+            spdlog::info("[OBC] state {} -> {} reason={}",
+                         book_sync_state_to_string_(state_), book_sync_state_to_string_(next), reason);
         }
-        std::cerr << "\n";
         state_ = next;
     }
 
@@ -29,17 +29,13 @@ namespace md {
                                                                   std::uint64_t first_seq,
                                                                   std::uint64_t last_seq,
                                                                   std::uint64_t expected_seq) {
-        std::cerr << "[OrderBookController] need resync"
-                  << " state=" << book_sync_state_to_string_(state_);
-        if (!reason.empty()) {
-            std::cerr << " reason=" << reason;
-        }
         if (first_seq != 0 || last_seq != 0 || expected_seq != 0) {
-            std::cerr << " first_seq=" << first_seq
-                      << " last_seq=" << last_seq
-                      << " expected_seq=" << expected_seq;
+            spdlog::warn("[OBC] need_resync state={} reason={} first_seq={} last_seq={} expected_seq={}",
+                         book_sync_state_to_string_(state_), reason, first_seq, last_seq, expected_seq);
+        } else {
+            spdlog::warn("[OBC] need_resync state={} reason={}",
+                         book_sync_state_to_string_(state_), reason);
         }
-        std::cerr << "\n";
         resetBook();
         return Action::NeedResync;
     }
@@ -47,15 +43,24 @@ namespace md {
     OrderBookController::Action
     OrderBookController::onSnapshot(const GenericSnapshotFormat &msg, BaselineKind kind) {
         resetBook();
-        std::cerr << "[OrderBookController] applying snapshot"
-                  << " baseline=" << (kind == BaselineKind::WsAuthoritative ? "ws_authoritative" : "rest_anchored")
-                  << " seq=" << msg.lastUpdateId
-                  << " bids=" << msg.bids.size()
-                  << " asks=" << msg.asks.size()
-                  << "\n";
+        spdlog::info("[OBC] applying snapshot baseline={} seq={} bids={} asks={}",
+                     (kind == BaselineKind::WsAuthoritative ? "ws_authoritative" : "rest_anchored"),
+                     msg.lastUpdateId, msg.bids.size(), msg.asks.size());
 
         std::vector<Level> bids = msg.bids;
         std::vector<Level> asks = msg.asks;
+
+        // B7: zero-qty levels in a snapshot are anomalous (in incrementals they are
+        // valid remove signals, but a snapshot should only contain resting liquidity).
+        auto skip_zero_qty = [](const Level &l) {
+            if (l.quantityLot == 0) {
+                spdlog::debug("[OBC] snapshot zero-qty level skipped priceTick={}", l.priceTick);
+                return true;
+            }
+            return false;
+        };
+        std::erase_if(bids, skip_zero_qty);
+        std::erase_if(asks, skip_zero_qty);
 
         std::sort(asks.begin(), asks.end(),
                   [](const Level &x, const Level &y) { return x.priceTick < y.priceTick; });
@@ -76,7 +81,7 @@ namespace md {
         // include a checksum on the initial baseline but do include them on incrementals).
         if (checksum_enabled) {
             if (msg.checksum == 0) {
-                std::cerr << "[OrderBookController] snapshot has no checksum (best-effort baseline)\n";
+                spdlog::debug("[OBC] snapshot has no checksum (best-effort baseline)");
                 // Continue without validation — first incremental checksum will verify.
             } else if (!validateChecksum(msg.checksum)) {
                 return need_resync_("snapshot_checksum_mismatch");
@@ -109,43 +114,40 @@ namespace md {
             if (has_seq) {
                 const std::uint64_t required = expected_seq_;
 
-                std::cerr << "[CTRL][BRIDGE] last_seq_=" << last_seq_
-                        << " required=" << required
-                        << " msg.first=" << msg.first_seq
-                        << " msg.last=" << msg.last_seq
-                        << "\n";
+                spdlog::debug("[OBC][BRIDGE] last_seq_={} required={} msg.first={} msg.last={}",
+                              last_seq_, required, msg.first_seq, msg.last_seq);
 
                 if (msg.last_seq < required) {
-                    std::cerr << "[CTRL][BRIDGE] IGNORE too-old: msg.last < required ("
-                            << msg.last_seq << " < " << required << ")\n";
+                    spdlog::debug("[OBC][BRIDGE] IGNORE too-old: msg.last < required ({} < {})",
+                                  msg.last_seq, required);
                     return Action::None;
                 }
 
                 if (msg.first_seq > required) {
                     if (!allow_seq_gap_) {
-                        std::cerr << "[CTRL][BRIDGE] RESYNC gap: msg.first > required ("
-                                << msg.first_seq << " > " << required << ")\n";
+                        spdlog::debug("[OBC][BRIDGE] RESYNC gap: msg.first > required ({} > {})",
+                                      msg.first_seq, required);
                         return need_resync_("bridge_sequence_gap", msg.first_seq, msg.last_seq, required);
                     } else {
-                        std::cerr << "[CTRL][BRIDGE] GAP tolerated (allow_seq_gap_)\n";
+                        spdlog::debug("[OBC][BRIDGE] GAP tolerated (allow_seq_gap_)");
                         // fall through and apply below
                     }
                 }
 
                 // Covers required (overlap OK for absolute level-set updates) or
                 // gap-tolerated case.
-                std::cerr << "[CTRL][BRIDGE] APPLY covers required=" << required
-                        << " (first=" << msg.first_seq << ", last=" << msg.last_seq << ")\n";
+                spdlog::debug("[OBC][BRIDGE] APPLY covers required={} (first={}, last={})",
+                              required, msg.first_seq, msg.last_seq);
 
                 applyIncrementUpdate(msg);
                 last_seq_ = msg.last_seq;
                 expected_seq_ = last_seq_ + 1;
                 set_state_(BookSyncState::Synced, "bridge_incremental_applied");
 
-                std::cerr << "[CTRL][BRIDGE] -> Synced last_seq_=" << last_seq_
-                        << " expected_seq_=" << expected_seq_ << "\n";
+                spdlog::debug("[OBC][BRIDGE] -> Synced last_seq_={} expected_seq_={}",
+                              last_seq_, expected_seq_);
             } else {
-                std::cerr << "[CTRL][BRIDGE] APPLY seq-less -> Synced\n";
+                spdlog::debug("[OBC][BRIDGE] APPLY seq-less -> Synced");
                 applyIncrementUpdate(msg);
                 set_state_(BookSyncState::Synced, "bridge_seqless_incremental_applied");
             }
@@ -155,19 +157,19 @@ namespace md {
                 const auto &bid = book_.best_bid();
                 const auto &ask = book_.best_ask();
                 if (bid.priceTick > 0 && ask.priceTick > 0 && bid.priceTick >= ask.priceTick) {
-                    std::cerr << "[OrderBookController] book_crossed after bridge"
-                              << " bid=" << bid.priceTick << " ask=" << ask.priceTick << "\n";
+                    spdlog::warn("[OBC] book_crossed after bridge bid={} ask={}",
+                                 bid.priceTick, ask.priceTick);
                     return need_resync_("book_crossed_bridge", msg.first_seq, msg.last_seq, expected_seq_);
                 }
             }
 
             if (checksum_enabled) {
                 if (msg.checksum == 0) {
-                    std::cerr << "[CTRL][BRIDGE] RESYNC missing checksum while enabled\n";
+                    spdlog::debug("[OBC][BRIDGE] RESYNC missing checksum while enabled");
                     return need_resync_("bridge_missing_checksum", msg.first_seq, msg.last_seq, expected_seq_);
                 }
                 if (!validateChecksum(msg.checksum)) {
-                    std::cerr << "[CTRL][BRIDGE] RESYNC checksum mismatch\n";
+                    spdlog::debug("[OBC][BRIDGE] RESYNC checksum mismatch");
                     return need_resync_("bridge_checksum_mismatch", msg.first_seq, msg.last_seq, expected_seq_);
                 }
             }
@@ -178,13 +180,8 @@ namespace md {
         // ---- Steady-state (Synced) ----
         if (has_seq) {
             const std::uint64_t required = expected_seq_;
-            std::cerr << "[OrderBookController] applying steady_state incremental"
-                      << " required_seq=" << required
-                      << " first_seq=" << msg.first_seq
-                      << " last_seq=" << msg.last_seq
-                      << " bids=" << msg.bids.size()
-                      << " asks=" << msg.asks.size()
-                      << "\n";
+            spdlog::debug("[OBC] steady_state incremental required_seq={} first_seq={} last_seq={} bids={} asks={}",
+                          required, msg.first_seq, msg.last_seq, msg.bids.size(), msg.asks.size());
 
             if (msg.last_seq < required) return Action::None; // outdated
             if (msg.first_seq > required) {
@@ -208,8 +205,8 @@ namespace md {
             const auto &bid = book_.best_bid();
             const auto &ask = book_.best_ask();
             if (bid.priceTick > 0 && ask.priceTick > 0 && bid.priceTick >= ask.priceTick) {
-                std::cerr << "[OrderBookController] book_crossed after incremental"
-                          << " bid=" << bid.priceTick << " ask=" << ask.priceTick << "\n";
+                spdlog::warn("[OBC] book_crossed after incremental bid={} ask={}",
+                             bid.priceTick, ask.priceTick);
                 return need_resync_("book_crossed", msg.first_seq, msg.last_seq, expected_seq_);
             }
         }
@@ -219,7 +216,7 @@ namespace md {
             if (++validate_counter_ >= validate_period_) {
                 validate_counter_ = 0;
                 if (!book_.validate()) {
-                    std::cerr << "[OrderBookController] validate() failed after incremental\n";
+                    spdlog::warn("[OBC] validate() failed after incremental");
                     return need_resync_("validate_failed", msg.first_seq, msg.last_seq, expected_seq_);
                 }
             }
@@ -232,6 +229,12 @@ namespace md {
             if (!validateChecksum(msg.checksum)) {
                 return need_resync_("steady_state_checksum_mismatch", msg.first_seq, msg.last_seq, expected_seq_);
             }
+        }
+
+        // C5: --require-checksum strict mode: venue declares checksums but field absent
+        // and no validation fn is wired (e.g. future re-enabled venue without fn yet).
+        if (require_checksum_ && has_checksum_ && !checksum_fn_ && msg.checksum == 0) {
+            return need_resync_("required_checksum_absent", msg.first_seq, msg.last_seq, expected_seq_);
         }
 
         return Action::None;

@@ -27,6 +27,7 @@ target_link_libraries(common_core PUBLIC
     Threads::Threads
     ZLIB::ZLIB
     nlohmann_json::nlohmann_json
+    spdlog::spdlog
 )
 
 if(TARGET Boost::system)

@@ -60,6 +60,7 @@ Disabled when `--brain_ws_host` is absent.
 |---|---|---|
 | `--max_msg_rate` | 0 | C2: Expected max messages/sec for this venue. A WARN is logged if the measured rate exceeds 2× this value at each heartbeat. 0 = disabled. |
 | `--validate_every` | 0 | C3: Call `OrderBook::validate()` every N applied updates; triggers a resync if sort-order or uniqueness invariants are violated. 0 = disabled. |
+| `--require_checksum` | false | C5: Strict checksum mode. Triggers a resync if a steady-state incremental arrives with `checksum==0` on a venue that declares it provides checksums (`has_checksum=true`). No-op on venues without checksum support. |
 
 ### Network tuning (optional)
 
@@ -205,15 +206,17 @@ struct VenueCaps {
 };
 ```
 
-**Sync modes by venue**
+**Sync modes and checksum coverage by venue**
 
-| Venue | SyncMode | Checksum | Notes |
-|---|---|---|---|
-| Binance | RestAnchored | No | Standard REST+WS bridge |
-| OKX | RestAnchored | No | |
-| Bybit | RestAnchored | No | Spot WS only supports depths 1 / 50 / 200; `--depthLevel` is capped automatically |
-| Bitget | RestAnchored | No (disabled) | CRC-32 disabled: WS snapshot has no verified baseline and seq gap makes incremental CRC invalid. `allow_seq_gap=true`. Re-enable if REST snapshot is used as baseline. |
-| KuCoin | WsAuthoritative | No | HTTP bullet bootstrap required; `allow_seq_gap=true` |
+| Venue | SyncMode | `has_checksum` | Algorithm | Status | Notes |
+|---|---|---|---|---|---|
+| Binance | RestAnchored | false | — | None | No checksum on WS updates |
+| OKX | RestAnchored | true | CRC-32 top-25 levels | ✅ Active | Validated on every steady-state incremental |
+| Bybit | RestAnchored | false | — | None | No checksum on WS updates; depth capped to 1/50/200 |
+| Bitget | RestAnchored | false | CRC-32 top-25 | ⚠ Disabled | WS snapshot has no verified baseline; seq gap makes incremental CRC invalid. `allow_seq_gap=true`. Re-enable with REST snapshot baseline. |
+| KuCoin | WsAuthoritative | false | — | None | HTTP bullet bootstrap required; `allow_seq_gap=true` |
+
+`--require_checksum` only activates on venues where `has_checksum=true` (currently OKX). It is a no-op on all other venues.
 
 ---
 

@@ -48,6 +48,10 @@ namespace md {
         // For local testing with self-signed certs you can disable it.
         void set_tls_verify_peer(bool enabled) { tls_verify_peer_ = enabled; }
 
+        // F1: mTLS — load a client certificate and private key (PEM files).
+        // Must be called before connect().  Throws boost::system::system_error on failure.
+        void set_client_cert(const std::string &certfile, const std::string &keyfile);
+
         // Limit number of queued outgoing messages when the socket is not writable/open.
         // If exceeded, the oldest messages are dropped.
         void set_max_outbox(std::size_t max) { max_outbox_ = max; }

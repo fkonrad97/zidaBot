@@ -2,7 +2,7 @@
 
 #include <atomic>
 #include <cstddef>
-#include <iostream>
+#include <spdlog/spdlog.h>
 #include <vector>
 #include <string_view>
 #include "orderbook/OrderBook.hpp"
@@ -30,15 +30,15 @@ namespace md::debug {
         int maxc = md::debug::raw_max.load(std::memory_order_relaxed);
         if (maxc <= 0) return;
         if (static_cast<int>(msg.size()) > maxc) msg = msg.substr(0, static_cast<std::size_t>(maxc));
-        std::cerr << "  raw=\"" << msg << "\"\n";
+        spdlog::debug("  raw=\"{}\"", msg);
     }
 
     static void dbg_levels(const char *side, const std::vector<Level> &v) {
         const int top = md::debug::top_levels.load(std::memory_order_relaxed);
         if (top <= 0) return;
-        std::cerr << "  " << side << " top" << top << ":\n";
+        spdlog::debug("  {} top{}:", side, top);
         for (int i = 0; i < top && i < static_cast<int>(v.size()); ++i) {
-            std::cerr << "    " << i << " " << v[i].price << " x " << v[i].quantity << "\n";
+            spdlog::debug("    {} {} x {}", i, v[i].price, v[i].quantity);
         }
     }
 }

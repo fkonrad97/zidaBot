@@ -5,6 +5,7 @@
 #include <boost/program_options.hpp>
 #include <string>
 #include <iostream>
+#include <fstream>
 #include <algorithm>
 #include <optional>
 #include <ranges>
@@ -25,6 +26,8 @@ struct CmdOptions {
     std::optional<std::string> brain_ws_port; // outbound brain WS port (optional)
     std::optional<std::string> brain_ws_path; // outbound brain WS path (optional)
     bool brain_ws_insecure{false}; // disable TLS verification (local testing)
+    std::optional<std::string> brain_ws_certfile; // F1: mTLS client cert PEM
+    std::optional<std::string> brain_ws_keyfile;  // F1: mTLS client key PEM
     std::optional<std::string> persist_path; // optional JSONL persistence file
     std::optional<std::string> log_path; // optional process log file path
     int persist_book_every_updates{0}; // 0 = disabled
@@ -32,6 +35,8 @@ struct CmdOptions {
     int rest_timeout_ms{8000}; // REST snapshot request timeout
     int max_msg_rate_per_sec{0};   // C2: 0 = disabled
     int validate_every{0};         // C3: 0 = disabled
+    bool require_checksum{false};  // C5: strict checksum enforcement
+    std::string log_level{"info"}; // D1: debug | info | warn | error
 
     // Debug flags
     bool debug{false};
@@ -65,6 +70,8 @@ inline bool parse_cmdline(int argc, char **argv, CmdOptions &out) {
     po::options_description desc("Options");
     desc.add_options()
             ("help,h", "Show this help message")
+            ("config", po::value<std::string>()->default_value(""),
+             "F2: config file path (key=value per line; CLI flags override file values)")
             ("venue,v", po::value<std::string>()->required(),
              "Venue name (binance, okx, bybit, bitget, kucoin)")
             ("base", po::value<std::string>()->required(),
@@ -93,6 +100,10 @@ inline bool parse_cmdline(int argc, char **argv, CmdOptions &out) {
              "Optional brain WebSocket path/target, e.g. /pop")
             ("brain_ws_insecure", po::bool_switch()->default_value(false),
              "Brain WS: disable TLS cert/host verification (local testing only)")
+            ("brain_ws_certfile", po::value<std::string>(),
+             "F1: mTLS client certificate PEM file for PoP->brain connection")
+            ("brain_ws_keyfile", po::value<std::string>(),
+             "F1: mTLS client private key PEM file for PoP->brain connection")
             ("persist_path", po::value<std::string>(),
              "Optional persistence output file path (JSONL)")
             ("log_path", po::value<std::string>(),
@@ -107,6 +118,10 @@ inline bool parse_cmdline(int argc, char **argv, CmdOptions &out) {
              "C2: warn if msgs/sec exceeds 2x this value at heartbeat (0=disabled)")
             ("validate_every", po::value<int>()->default_value(0),
              "C3: call OrderBook::validate() every N applied updates (0=disabled)")
+            ("require_checksum", po::bool_switch()->default_value(false),
+             "C5: resync if checksum field is absent on a checksum-capable venue")
+            ("log_level", po::value<std::string>()->default_value("info"),
+             "D1: log verbosity: debug | info | warn | error")
             ("debug", po::bool_switch()->default_value(false),
              "Enable debug logging (rate-limited)")
             ("debug_raw", po::bool_switch()->default_value(false),
@@ -124,7 +139,23 @@ inline bool parse_cmdline(int argc, char **argv, CmdOptions &out) {
 
     po::variables_map vm;
     try {
+        // F2: CLI is parsed first so its values win over the config file.
+        // po::variables_map::store() does not override already-set keys,
+        // so storing CLI first and file second implements "CLI overrides file".
         po::store(po::parse_command_line(argc, argv, desc), vm);
+
+        // Load config file if --config was given on the command line.
+        const std::string config_path = vm.count("config") ? vm["config"].as<std::string>() : "";
+        if (!config_path.empty()) {
+            std::ifstream cfg_stream(config_path);
+            if (!cfg_stream) {
+                std::cerr << "Error: cannot open config file: " << config_path << "\n";
+                return false;
+            }
+            // allow_unregistered=true so unknown keys in the file are silently skipped.
+            po::store(po::parse_config_file(cfg_stream, desc, /*allow_unregistered=*/true), vm);
+            std::cerr << "[pop] config file loaded: " << config_path << "\n";
+        }
 
         if (vm.count("help")) {
             std::cout << "Usage: " << argv[0]
@@ -163,6 +194,8 @@ inline bool parse_cmdline(int argc, char **argv, CmdOptions &out) {
     if (vm.count("brain_ws_port")) out.brain_ws_port = vm["brain_ws_port"].as<std::string>();
     if (vm.count("brain_ws_path")) out.brain_ws_path = vm["brain_ws_path"].as<std::string>();
     out.brain_ws_insecure = vm["brain_ws_insecure"].as<bool>();
+    if (vm.count("brain_ws_certfile")) out.brain_ws_certfile = vm["brain_ws_certfile"].as<std::string>();
+    if (vm.count("brain_ws_keyfile"))  out.brain_ws_keyfile  = vm["brain_ws_keyfile"].as<std::string>();
     if (vm.count("persist_path")) out.persist_path = vm["persist_path"].as<std::string>();
     if (vm.count("log_path")) out.log_path = vm["log_path"].as<std::string>();
     out.persist_book_every_updates = std::max(0, vm["persist_book_every_updates"].as<int>());
@@ -170,6 +203,8 @@ inline bool parse_cmdline(int argc, char **argv, CmdOptions &out) {
     out.rest_timeout_ms = std::max(1000, vm["rest_timeout_ms"].as<int>());
     out.max_msg_rate_per_sec = std::max(0, vm["max_msg_rate"].as<int>());
     out.validate_every = std::max(0, vm["validate_every"].as<int>());
+    out.require_checksum = vm["require_checksum"].as<bool>();
+    out.log_level = vm["log_level"].as<std::string>();
 
     /// DEBUG
     out.debug = vm["debug"].as<bool>();

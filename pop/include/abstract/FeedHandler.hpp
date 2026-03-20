@@ -57,6 +57,10 @@ namespace md {
         std::string brain_ws_port;
         std::string brain_ws_path;
         bool brain_ws_insecure{false}; // testing only: disable TLS cert/host verification
+        // F1: mTLS client certificate for PoP→brain connection (optional).
+        // Both must be set to enable mTLS; if either is empty, plain TLS is used.
+        std::string brain_ws_certfile;
+        std::string brain_ws_keyfile;
 
         std::string persist_path; ///< optional event persistence file path, "" = disabled
         std::size_t persist_book_every_updates{0}; ///< 0 = disabled
@@ -69,6 +73,9 @@ namespace md {
 
         /// C3: call OrderBook::validate() every N applied updates; 0 = disabled.
         int validate_every{0};
+
+        /// C5: require non-zero checksum on every incremental for checksum-capable venues.
+        bool require_checksum{false};
 
         size_t depthLevel{0};
     };

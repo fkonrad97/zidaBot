@@ -2,7 +2,8 @@
 
 #include <algorithm>
 #include <chrono>
-#include <iostream>
+#include <random>
+#include <spdlog/spdlog.h>
 
 namespace md {
     namespace {
@@ -19,7 +20,9 @@ namespace md {
                                  std::string target,
                                  bool insecure_tls,
                                  std::string venue,
-                                 std::string symbol)
+                                 std::string symbol,
+                                 std::string client_certfile,
+                                 std::string client_keyfile)
         : ioc_(ioc),
           ws_(WsClient::create(ioc)),
           reconnect_timer_(ioc),
@@ -28,7 +31,9 @@ namespace md {
           target_(std::move(target)),
           venue_(std::move(venue)),
           symbol_(std::move(symbol)),
-          insecure_tls_(insecure_tls) {
+          insecure_tls_(insecure_tls),
+          client_certfile_(std::move(client_certfile)),
+          client_keyfile_(std::move(client_keyfile)) {
         ws_->set_tls_verify_peer(!insecure_tls);
         // If brain is down or slow, keep memory bounded; prefer freshest updates.
         ws_->set_max_outbox(kDefaultMaxOutbox);
@@ -44,12 +49,25 @@ namespace md {
         reconnect_scheduled_ = false;
         reconnect_gen_++;
 
+        // F1: mTLS — load client certificate before the first connect attempt.
+        if (!client_certfile_.empty() && !client_keyfile_.empty()) {
+            try {
+                ws_->set_client_cert(client_certfile_, client_keyfile_);
+                spdlog::info("[WsPublishSink] mTLS client cert loaded certfile={}", client_certfile_);
+            } catch (const std::exception &e) {
+                spdlog::error("[WsPublishSink] failed to load mTLS client cert: {}", e.what());
+                running_ = false;
+                return;
+            }
+        }
+
         ws_->set_on_open([this] {
             reconnect_delay_ms_ = kReconnectDelayMinMs;
             reconnect_scheduled_ = false;
-            std::cerr << "[WsPublishSink] connected brain ws host=" << host_ << " port=" << port_ << " target=" << target_ << "\n";
+            spdlog::info("[WsPublishSink] connected brain ws host={} port={} target={}",
+                         host_, port_, target_);
             if (insecure_tls_)
-                std::cerr << "[WsPublishSink] WARNING: TLS certificate verification is DISABLED (--brain_ws_insecure)\n";
+                spdlog::warn("[WsPublishSink] TLS certificate verification is DISABLED (--brain_ws_insecure)");
         });
 
         ws_->set_on_close([this] {
@@ -58,7 +76,7 @@ namespace md {
         });
 
         ws_->set_logger([](std::string_view msg) {
-            std::cerr << "[WsPublishSink] " << msg << "\n";
+            spdlog::debug("[WsPublishSink] {}", msg);
         });
 
         connect_();
@@ -121,7 +139,13 @@ namespace md {
         reconnect_scheduled_ = true;
 
         const auto gen = ++reconnect_gen_;
-        const int delay = reconnect_delay_ms_;
+
+        // F6: ±25% jitter to prevent thundering herd on simultaneous restarts
+        static thread_local std::mt19937 rng{std::random_device{}()};
+        static thread_local std::uniform_real_distribution<double> jitter(-0.25, 0.25);
+        const int base = reconnect_delay_ms_;
+        const int jittered = static_cast<int>(base * (1.0 + jitter(rng)));
+        const int delay = std::max(100, jittered);
         reconnect_delay_ms_ = std::min(reconnect_delay_ms_ * 2, kReconnectDelayMaxMs);
 
         reconnect_timer_.expires_after(std::chrono::milliseconds(delay));

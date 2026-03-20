@@ -5,6 +5,7 @@
 #include "md/VenueAdapter.hpp"
 #include "orderbook/OrderBookUtils.hpp"
 #include "utils/DebugConfigUtils.hpp"
+#include <spdlog/spdlog.h>
 
 using json = nlohmann::json;
 
@@ -80,7 +81,7 @@ namespace md {
         json j = json::parse(msg.begin(), msg.end(), nullptr, false);
         if (j.is_discarded()) {
             if (debug::dbg_on()) {
-                std::cerr << "[BINANCE][SNAPSHOT] json parse failed\n";
+                spdlog::debug("[BINANCE][SNAPSHOT] json parse failed");
                 debug::dbg_raw(msg);
             }
             return false;
@@ -113,18 +114,12 @@ namespace md {
         if (debug::dbg_on()) {
             static std::uint64_t inc_cnt = 0;
             if (debug::dbg_sample(inc_cnt)) {
-                std::cerr << "[BINANCE][INC#" << inc_cnt << "] ";
-                if (md::debug::show_seq.load(std::memory_order_relaxed)) {
-                    std::cerr << "prev=" << update.prev_last
-                            << " first=" << update.first_seq
-                            << " last=" << update.last_seq << " ";
-                }
-                std::cerr << "b=" << update.bids.size()
-                        << " a=" << update.asks.size();
-                if (md::debug::show_checksum.load(std::memory_order_relaxed)) {
-                    std::cerr << " checksum=" << update.checksum;
-                }
-                std::cerr << "\n";
+                spdlog::debug("[BINANCE][INC#{}] {}b={} a={} checksum={}",
+                    inc_cnt,
+                    (md::debug::show_seq.load(std::memory_order_relaxed) ?
+                        std::string("prev=") + std::to_string(update.prev_last) + " first=" + std::to_string(update.first_seq) + " last=" + std::to_string(update.last_seq) + " " : ""),
+                    update.bids.size(), update.asks.size(),
+                    (md::debug::show_checksum.load(std::memory_order_relaxed) ? std::to_string(update.checksum) : ""));
                 debug::dbg_raw(msg);
             }
         }
@@ -140,7 +135,7 @@ namespace md {
             json j = json::parse(body.begin(), body.end(), nullptr, false);
             if (j.is_discarded()) {
                 if (debug::dbg_on()) {
-                    std::cerr << "[BINANCE][SNAPSHOT] json parse failed\n";
+                    spdlog::debug("[BINANCE][SNAPSHOT] json parse failed");
                     debug::dbg_raw(body);
                 }
                 return false;
@@ -164,14 +159,9 @@ namespace md {
                 static std::uint64_t snap_cnt = 0;
                 // snapshot is rare; log always or sample—your choice:
                 ++snap_cnt;
-                std::cerr << "[BINANCE][SNAPSHOT#" << snap_cnt << "] "
-                        << "seqId=" << snap.lastUpdateId
-                        << " bids=" << snap.bids.size()
-                        << " asks=" << snap.asks.size();
-                if (md::debug::show_checksum.load(std::memory_order_relaxed)) {
-                    std::cerr << " checksum=" << snap.checksum;
-                }
-                std::cerr << "\n";
+                spdlog::debug("[BINANCE][SNAPSHOT#{}] seqId={} bids={} asks={} checksum={}",
+                    snap_cnt, snap.lastUpdateId, snap.bids.size(), snap.asks.size(),
+                    (md::debug::show_checksum.load(std::memory_order_relaxed) ? std::to_string(snap.checksum) : ""));
                 debug::dbg_levels("bid", snap.bids);
                 debug::dbg_levels("ask", snap.asks);
                 debug::dbg_raw(body);

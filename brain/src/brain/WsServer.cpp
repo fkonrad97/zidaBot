@@ -1,7 +1,7 @@
 #include "brain/WsServer.hpp"
 
 #include <algorithm>
-#include <iostream>
+#include <spdlog/spdlog.h>
 
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/strand.hpp>
@@ -29,19 +29,18 @@ WsServer::WsServer(net::io_context &ioc,
     beast::error_code ec;
 
     acceptor_.open(endpoint.protocol(), ec);
-    if (ec) { std::cerr << "[WsServer] open: " << ec.message() << "\n"; return; }
+    if (ec) { spdlog::error("[WsServer] open: {}", ec.message()); return; }
 
     acceptor_.set_option(net::socket_base::reuse_address(true), ec);
-    if (ec) { std::cerr << "[WsServer] set_option: " << ec.message() << "\n"; return; }
+    if (ec) { spdlog::error("[WsServer] set_option: {}", ec.message()); return; }
 
     acceptor_.bind(endpoint, ec);
-    if (ec) { std::cerr << "[WsServer] bind: " << ec.message() << "\n"; return; }
+    if (ec) { spdlog::error("[WsServer] bind: {}", ec.message()); return; }
 
     acceptor_.listen(net::socket_base::max_listen_connections, ec);
-    if (ec) { std::cerr << "[WsServer] listen: " << ec.message() << "\n"; return; }
+    if (ec) { spdlog::error("[WsServer] listen: {}", ec.message()); return; }
 
-    std::cerr << "[WsServer] listening on "
-              << endpoint.address().to_string() << ":" << endpoint.port() << "\n";
+    spdlog::info("[WsServer] listening on {}:{}", endpoint.address().to_string(), endpoint.port());
 }
 
 void WsServer::start() {
@@ -81,7 +80,7 @@ void WsServer::do_accept_() {
 void WsServer::on_accept_(beast::error_code ec, tcp::socket socket) {
     if (ec) {
         if (ec != net::error::operation_aborted)
-            std::cerr << "[WsServer] accept error: " << ec.message() << "\n";
+            spdlog::warn("[WsServer] accept error: {}", ec.message());
         return;
     }
 
@@ -93,7 +92,7 @@ void WsServer::on_accept_(beast::error_code ec, tcp::socket socket) {
 
     constexpr std::size_t kMaxSessions = 10;
     if (sessions_.size() >= kMaxSessions) {
-        std::cerr << "[WsServer] connection limit reached (" << kMaxSessions << "), dropping new client\n";
+        spdlog::warn("[WsServer] connection limit reached ({}), dropping new client", kMaxSessions);
         do_accept_();
         return;
     }
@@ -162,7 +161,7 @@ void WsSession::do_ws_accept_() {
     ws_.async_accept(
         [self = shared_from_this()](beast::error_code ec) {
             if (ec) { self->fail_(ec, "ws_accept"); return; }
-            std::cerr << "[WsServer] client connected addr=" << self->remote_addr_ << "\n";
+            spdlog::info("[WsServer] client connected addr={}", self->remote_addr_);
             self->ws_.read_message_max(4 * 1024 * 1024); // 4 MB hard limit per frame
             self->do_read_();
         }
@@ -178,8 +177,7 @@ void WsSession::do_read_() {
                     ec != net::error::operation_aborted)
                     self->fail_(ec, "read");
                 else
-                    std::cerr << "[WsServer] client disconnected addr="
-                              << self->remote_addr_ << "\n";
+                    spdlog::info("[WsServer] client disconnected addr={}", self->remote_addr_);
                 return;
             }
 
@@ -197,8 +195,7 @@ void WsSession::do_read_() {
 }
 
 void WsSession::fail_(beast::error_code ec, std::string_view where) {
-    std::cerr << "[WsServer] " << where << ": " << ec.message()
-              << " addr=" << remote_addr_ << "\n";
+    spdlog::warn("[WsServer] {}: {} addr={}", where, ec.message(), remote_addr_);
 }
 
 } // namespace brain

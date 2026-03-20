@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <iostream>
+#include <spdlog/spdlog.h>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -27,7 +27,7 @@ ArbDetector::ArbDetector(double min_spread_bps,
     if (!output_path.empty()) {
         output_.open(output_path, std::ios::out | std::ios::app);
         if (!output_.is_open())
-            std::cerr << "[ArbDetector] WARNING: could not open output file: " << output_path << "\n";
+            spdlog::warn("[ArbDetector] could not open output file: {}", output_path);
     }
 }
 
@@ -58,10 +58,9 @@ void ArbDetector::rotate_output_() {
     // Open a fresh file
     output_.open(output_path_base_, std::ios::out | std::ios::trunc);
     if (!output_.is_open()) {
-        std::cerr << "[ArbDetector] WARNING: could not reopen output after rotation\n";
+        spdlog::warn("[ArbDetector] could not reopen output after rotation");
     } else {
-        std::cerr << "[ArbDetector] rotated output to " << rotated
-                  << " (bytes=" << output_bytes_ << ")\n";
+        spdlog::info("[ArbDetector] rotated output to {} (bytes={})", rotated, output_bytes_);
     }
     output_bytes_ = 0;
 }
@@ -70,12 +69,8 @@ void ArbDetector::emit_(const ArbCross &c) {
     ++crosses_total_;
     last_cross_ns_ = c.ts_detected_ns;
 
-    // Log to stderr
-    std::cerr << "[ARB] sell=" << c.sell_venue
-              << " bid=" << c.sell_bid_tick
-              << " buy=" << c.buy_venue
-              << " ask=" << c.buy_ask_tick
-              << " spread=" << c.spread_bps << "bps\n";
+    spdlog::info("[ARB] sell={} bid={} buy={} ask={} spread={}bps",
+                 c.sell_venue, c.sell_bid_tick, c.buy_venue, c.buy_ask_tick, c.spread_bps);
 
     // Optionally write JSONL
     if (!output_.is_open()) return;
@@ -131,12 +126,10 @@ std::vector<ArbCross> ArbDetector::scan(const std::vector<VenueBook> &venues) {
                 const std::int64_t bid = venues[i].book().best_bid().priceTick;
                 if (bid > 0 && std::abs(static_cast<double>(bid) - median) > threshold) {
                     price_anomaly[i] = true;
-                    std::cerr << "[ArbDetector] B5 ANOMALY: venue=" << venues[i].venue_name
-                              << " best_bid=" << bid
-                              << " median=" << static_cast<std::int64_t>(median)
-                              << " deviation_pct="
-                              << std::abs(static_cast<double>(bid) - median) / median * 100.0
-                              << " > " << max_price_deviation_pct_ << "\n";
+                    spdlog::warn("[ArbDetector] B5 ANOMALY: venue={} best_bid={} median={} deviation_pct={} > {}",
+                                 venues[i].venue_name, bid, static_cast<std::int64_t>(median),
+                                 std::abs(static_cast<double>(bid) - median) / median * 100.0,
+                                 max_price_deviation_pct_);
                 }
             }
         }
@@ -180,9 +173,8 @@ std::vector<ArbCross> ArbDetector::scan(const std::vector<VenueBook> &venues) {
 
             // B1: upper spread cap — anomalously large spreads indicate a data error
             if (max_spread_bps_ > 0.0 && spread_bps > max_spread_bps_) {
-                std::cerr << "[ArbDetector] ANOMALY: spread " << spread_bps
-                          << "bps exceeds cap " << max_spread_bps_
-                          << "bps sell=" << sv.venue_name << " buy=" << bv.venue_name << "\n";
+                spdlog::warn("[ArbDetector] ANOMALY: spread {}bps exceeds cap {}bps sell={} buy={}",
+                             spread_bps, max_spread_bps_, sv.venue_name, bv.venue_name);
                 continue;
             }
 
