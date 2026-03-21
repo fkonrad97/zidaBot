@@ -18,7 +18,9 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <sstream>
 #include <string>
+#include <vector>
 #include "utils/DebugConfigUtils.hpp"
 
 static void print_book_bbo(const md::OrderBook &book) {
@@ -31,22 +33,120 @@ static void print_book_bbo(const md::OrderBook &book) {
 }
 
 
-static std::string make_binance_ws_topic(const CmdOptions &opt,
-                                         const md::FeedHandlerConfig &cfg,
+static std::string make_binance_ws_topic(const md::FeedHandlerConfig &cfg,
                                          const std::string &ws_symbol_only_lower) {
-    // Your BinanceAdapter does: "/ws/" + cfg.symbol
-    // So cfg.symbol must be: "btcusdt@depth@100ms" (or similar)
-    //
-    // If user passes ws_path override, we don't need symbol, but we still set it for logging.
-
-    // For now we support:
-    //   --channel depth        => <sym>@depth@100ms
-    //   --channel incremental  => also use depthUpdate stream; keep same
-    //
-    // You can later map to different channels (trade/bookTicker/etc).
     (void) cfg;
-
     return ws_symbol_only_lower + "@depth@100ms";
+}
+
+// F3: parse "BTC/USDT,ETH/USDT,SOL/USDT" into vector of (base, quote) pairs.
+static std::vector<std::pair<std::string, std::string>>
+parse_symbols(const std::string &symbols_str) {
+    std::vector<std::pair<std::string, std::string>> result;
+    std::string token;
+    std::istringstream ss(symbols_str);
+    while (std::getline(ss, token, ',')) {
+        // trim whitespace
+        token.erase(0, token.find_first_not_of(" \t"));
+        token.erase(token.find_last_not_of(" \t") + 1);
+        if (token.empty()) continue;
+        const auto slash = token.find('/');
+        if (slash == std::string::npos || slash == 0 || slash + 1 == token.size()) {
+            throw std::invalid_argument("Invalid symbol pair (expected BASE/QUOTE): " + token);
+        }
+        result.emplace_back(token.substr(0, slash), token.substr(slash + 1));
+    }
+    return result;
+}
+
+// F3: derive per-symbol persist path from the base path.
+// "/tmp/binance.jsonl" + BTC/USDT  =>  "/tmp/binance_BTC_USDT.jsonl"
+// "/tmp/binance.jsonl.gz" + BTC/USDT  =>  "/tmp/binance_BTC_USDT.jsonl.gz"
+// If base path is empty, returns "".
+static std::string derive_persist_path(const std::string &base_path,
+                                       const std::string &base_ccy,
+                                       const std::string &quote_ccy) {
+    if (base_path.empty()) return "";
+
+    const std::string suffix = "_" + base_ccy + "_" + quote_ccy;
+
+    // Find last '.' that belongs to an extension (not a directory separator).
+    const auto last_sep = base_path.find_last_of("/\\");
+    const auto last_dot = base_path.find_last_of('.');
+    if (last_dot == std::string::npos ||
+        (last_sep != std::string::npos && last_dot < last_sep)) {
+        // No extension — just append suffix.
+        return base_path + suffix;
+    }
+
+    // Handle double extension: ".jsonl.gz"
+    const std::string ext = base_path.substr(last_dot);
+    const std::string stem = base_path.substr(0, last_dot);
+
+    // Check for ".jsonl.gz" or ".log.gz" style
+    if (ext == ".gz") {
+        const auto second_dot = stem.find_last_of('.');
+        if (second_dot != std::string::npos &&
+            (last_sep == std::string::npos || second_dot > last_sep)) {
+            return stem.substr(0, second_dot) + suffix + stem.substr(second_dot) + ".gz";
+        }
+    }
+
+    return stem + suffix + ext;
+}
+
+// Build a FeedHandlerConfig for one (base, quote) pair from the parsed CLI options.
+static md::FeedHandlerConfig build_cfg(const CmdOptions &options,
+                                       md::VenueId venue,
+                                       const std::string &base,
+                                       const std::string &quote,
+                                       const std::string &persist_path) {
+    md::FeedHandlerConfig cfg{};
+    cfg.venue_name  = venue;
+    cfg.base_ccy    = base;
+    cfg.quote_ccy   = quote;
+    cfg.depthLevel  = options.depthLevel.value_or(400);
+    cfg.ws_host     = options.ws_host.value_or("");
+    cfg.ws_port     = options.ws_port.value_or("");
+    cfg.ws_path     = options.ws_path.value_or("");
+    cfg.rest_host   = options.rest_host.value_or("");
+    cfg.rest_port   = options.rest_port.value_or("");
+    cfg.rest_path   = options.rest_path.value_or("");
+    cfg.brain_ws_host     = options.brain_ws_host.value_or("");
+    cfg.brain_ws_port     = options.brain_ws_port.value_or("");
+    cfg.brain_ws_path     = options.brain_ws_path.value_or("");
+    cfg.brain_ws_insecure = options.brain_ws_insecure;
+    cfg.brain_ws_certfile = options.brain_ws_certfile.value_or("");
+    cfg.brain_ws_keyfile  = options.brain_ws_keyfile.value_or("");
+    cfg.persist_path               = persist_path;
+    cfg.persist_book_every_updates = static_cast<std::size_t>(options.persist_book_every_updates);
+    cfg.persist_book_top           = static_cast<std::size_t>(options.persist_book_top);
+    cfg.rest_timeout_ms   = options.rest_timeout_ms;
+    cfg.max_msg_rate_per_sec = options.max_msg_rate_per_sec;
+    cfg.validate_every    = options.validate_every;
+    cfg.require_checksum  = options.require_checksum;
+
+    // Brain WS port/path defaults.
+    if (!cfg.brain_ws_host.empty()) {
+        if (cfg.brain_ws_port.empty()) cfg.brain_ws_port = "443";
+        if (cfg.brain_ws_path.empty()) cfg.brain_ws_path = "/";
+    }
+
+    // Symbol mapping.
+    const std::string ws_sym   = md::venue::map_ws_symbol(venue, base, quote);
+    const std::string rest_sym = md::venue::map_rest_symbol(venue, base, quote);
+
+    if (cfg.ws_path.empty()) {
+        cfg.symbol = (venue == md::VenueId::BINANCE)
+                         ? make_binance_ws_topic(cfg, ws_sym)
+                         : ws_sym;
+    } else {
+        cfg.symbol = (venue == md::VenueId::BINANCE)
+                         ? make_binance_ws_topic(cfg, ws_sym)
+                         : ws_sym;
+    }
+
+    return cfg;
 }
 
 int main(int argc, char **argv) {
@@ -66,9 +166,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // ---------------------------------------------------------------------
-    // 1) Validate venue + stream kind
-    // ---------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // 1) Validate venue
+    // -------------------------------------------------------------------------
     md::VenueId venue = parse_venue(options.venue);
     if (venue == md::VenueId::UNKNOWN) {
         spdlog::error("unknown venue '{}'. Expected one of: binance, okx, bybit, bitget, kucoin.",
@@ -76,46 +176,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // ---------------------------------------------------------------------
-    // 2) Build config
-    // ---------------------------------------------------------------------
-    md::FeedHandlerConfig cfg{};
-    cfg.venue_name = venue;
-    cfg.base_ccy = options.base;
-    cfg.quote_ccy = options.quote;
-
-    // depthLevel: your options_description sets default_value(400),
-    // so options.depthLevel should always be set in practice,
-    // but keep a safe fallback.
-    cfg.depthLevel = options.depthLevel.value_or(400);
-
-    cfg.ws_host = options.ws_host.value_or("");
-    cfg.ws_port = options.ws_port.value_or("");
-    cfg.ws_path = options.ws_path.value_or("");
-    cfg.rest_host = options.rest_host.value_or("");
-    cfg.rest_port = options.rest_port.value_or("");
-    cfg.rest_path = options.rest_path.value_or("");
-    cfg.brain_ws_host = options.brain_ws_host.value_or("");
-    cfg.brain_ws_port = options.brain_ws_port.value_or("");
-    cfg.brain_ws_path = options.brain_ws_path.value_or("");
-    cfg.brain_ws_insecure = options.brain_ws_insecure;
-    cfg.brain_ws_certfile = options.brain_ws_certfile.value_or("");
-    cfg.brain_ws_keyfile  = options.brain_ws_keyfile.value_or("");
-    cfg.persist_path = options.persist_path.value_or("");
-    cfg.persist_book_every_updates = static_cast<std::size_t>(options.persist_book_every_updates);
-    cfg.persist_book_top = static_cast<std::size_t>(options.persist_book_top);
-    cfg.rest_timeout_ms = options.rest_timeout_ms;
-    cfg.max_msg_rate_per_sec = options.max_msg_rate_per_sec;
-    cfg.validate_every = options.validate_every;
-    cfg.require_checksum = options.require_checksum;
-
-    // Brain WS defaults (only when enabled).
-    if (!cfg.brain_ws_host.empty()) {
-        if (cfg.brain_ws_port.empty()) cfg.brain_ws_port = "443";
-        if (cfg.brain_ws_path.empty()) cfg.brain_ws_path = "/";
-    }
-
-    /// DEBUG
+    // -------------------------------------------------------------------------
+    // 2) Debug flags (global atomics, shared by all handlers)
+    // -------------------------------------------------------------------------
     md::debug::enabled.store(options.debug, std::memory_order_relaxed);
     md::debug::raw.store(options.debug_raw, std::memory_order_relaxed);
     md::debug::every.store(options.debug_every, std::memory_order_relaxed);
@@ -124,64 +187,89 @@ int main(int argc, char **argv) {
     md::debug::show_checksum.store(options.debug_checksum, std::memory_order_relaxed);
     md::debug::show_seq.store(options.debug_seq, std::memory_order_relaxed);
 
-    // ---------------------------------------------------------------------
-    // 3) Symbol mapping
-    // ---------------------------------------------------------------------
-    // WS symbol mapping (BINANCE => "btcusdt")
-    const std::string ws_sym = md::venue::map_ws_symbol(cfg.venue_name, cfg.base_ccy, cfg.quote_ccy);
-    const std::string rest_sym = md::venue::map_rest_symbol(cfg.venue_name, cfg.base_ccy, cfg.quote_ccy);
+    // -------------------------------------------------------------------------
+    // 3) Build symbol list  (F3)
+    // -------------------------------------------------------------------------
+    std::vector<std::pair<std::string, std::string>> symbols; // (base, quote)
 
-    // For your BinanceAdapter, cfg.symbol must be the full topic token
-    // unless you override ws_path.
-    if (cfg.ws_path.empty()) {
-        if (cfg.venue_name == md::VenueId::BINANCE) {
-            cfg.symbol = make_binance_ws_topic(options, cfg, ws_sym);
-        } else {
-            // for other venues you'll likely use ws_sym directly or build a venue-specific topic
-            cfg.symbol = ws_sym;
+    if (options.symbols.has_value()) {
+        try {
+            symbols = parse_symbols(*options.symbols);
+        } catch (const std::exception &e) {
+            spdlog::error("--symbols parse error: {}", e.what());
+            return 1;
         }
     } else {
-        // ws_path override means adapter target will be forced anyway,
-        // but cfg.symbol can still be useful for logs/debug
-        cfg.symbol = (cfg.venue_name == md::VenueId::BINANCE) ? make_binance_ws_topic(options, cfg, ws_sym) : ws_sym;
+        // Fall back to single-symbol mode.
+        if (options.base.empty() || options.quote.empty()) {
+            spdlog::error("Either --symbols or both --base and --quote must be specified.");
+            return 1;
+        }
+        symbols.emplace_back(options.base, options.quote);
     }
 
-    // ---------------------------------------------------------------------
+    if (symbols.empty()) {
+        spdlog::error("No symbols to track. Provide --symbols or --base/--quote.");
+        return 1;
+    }
+
+    const bool multi = symbols.size() > 1;
+    const std::string base_persist = options.persist_path.value_or("");
+
+    // -------------------------------------------------------------------------
     // 4) Startup log
-    // ---------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     spdlog::info("[POP] Starting feed");
     spdlog::info("  venue      = {}", options.venue);
-    spdlog::info("  base/quote = {}/{}", cfg.base_ccy, cfg.quote_ccy);
-    spdlog::info("  depthLevel = {}", cfg.depthLevel);
-    spdlog::info("  ws_sym     = {}", ws_sym);
-    spdlog::info("  rest_sym   = {}", rest_sym);
-    spdlog::info("  cfg.symbol = {}", cfg.symbol);
-    spdlog::info("  ws_host    = {}", cfg.ws_host.empty() ? "<default>" : cfg.ws_host);
-    spdlog::info("  ws_port    = {}", cfg.ws_port.empty() ? "<default>" : cfg.ws_port);
-    spdlog::info("  ws_path    = {}", cfg.ws_path.empty() ? "<default>" : cfg.ws_path);
-    spdlog::info("  rest_host  = {}", cfg.rest_host.empty() ? "<default>" : cfg.rest_host);
-    spdlog::info("  rest_port  = {}", cfg.rest_port.empty() ? "<default>" : cfg.rest_port);
-    spdlog::info("  rest_path  = {}", cfg.rest_path.empty() ? "<default>" : cfg.rest_path);
-    spdlog::info("  brain_ws   = {}", cfg.brain_ws_host.empty()
-        ? "<disabled>" : (cfg.brain_ws_host + ":" + cfg.brain_ws_port + cfg.brain_ws_path));
-    spdlog::info("  persist    = {}", cfg.persist_path.empty() ? "<disabled>" : cfg.persist_path);
-    spdlog::info("  persist_book_every_updates = {}", cfg.persist_book_every_updates);
-    spdlog::info("  persist_book_top           = {}", cfg.persist_book_top);
+    spdlog::info("  symbols    = {} ({} handler{})",
+                 options.symbols.value_or(options.base + "/" + options.quote),
+                 symbols.size(), symbols.size() == 1 ? "" : "s");
+    spdlog::info("  depthLevel = {}", options.depthLevel.value_or(400));
+    spdlog::info("  brain_ws   = {}",
+                 options.brain_ws_host.value_or("").empty()
+                     ? "<disabled>"
+                     : (options.brain_ws_host.value_or("") + ":" +
+                        options.brain_ws_port.value_or("443") +
+                        options.brain_ws_path.value_or("/")));
+    spdlog::info("  persist    = {}", base_persist.empty()
+                                          ? "<disabled>"
+                                          : (multi ? base_persist + " (per-symbol derived)" : base_persist));
 
-    // ---------------------------------------------------------------------
-    // 5) Run
-    // ---------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // 5) Create and start one GenericFeedHandler per symbol
+    // -------------------------------------------------------------------------
     boost::asio::io_context ioc;
 
-    auto h = std::make_unique<md::GenericFeedHandler>(ioc);
+    std::vector<std::unique_ptr<md::GenericFeedHandler>> handlers;
+    handlers.reserve(symbols.size());
 
-    auto st = h->init(cfg);
-    spdlog::info("[MAIN] init = {}", (st == md::FeedOpResult::OK ? "OK" : "ERROR"));
-    if (st != md::FeedOpResult::OK) return 1;
+    for (const auto &[base, quote] : symbols) {
+        const std::string persist_path = multi
+                                             ? derive_persist_path(base_persist, base, quote)
+                                             : base_persist;
 
-    st = h->start();
-    spdlog::info("[MAIN] start = {}", (st == md::FeedOpResult::OK ? "OK" : "ERROR"));
-    if (st != md::FeedOpResult::OK) return 2;
+        md::FeedHandlerConfig cfg = build_cfg(options, venue, base, quote, persist_path);
+
+        spdlog::info("[POP] Registering {}/{} — symbol={}, persist={}",
+                     base, quote, cfg.symbol,
+                     persist_path.empty() ? "<disabled>" : persist_path);
+
+        auto h = std::make_unique<md::GenericFeedHandler>(ioc);
+        auto st = h->init(cfg);
+        if (st != md::FeedOpResult::OK) {
+            spdlog::error("[MAIN] init failed for {}/{}", base, quote);
+            return 1;
+        }
+        st = h->start();
+        if (st != md::FeedOpResult::OK) {
+            spdlog::error("[MAIN] start failed for {}/{}", base, quote);
+            return 2;
+        }
+        handlers.push_back(std::move(h));
+    }
+
+    spdlog::info("[MAIN] {} handler{} started — entering io_context loop",
+                 handlers.size(), handlers.size() == 1 ? "" : "s");
 
     ioc.run();
     md::log::flush();

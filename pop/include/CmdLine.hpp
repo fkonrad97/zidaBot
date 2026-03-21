@@ -13,8 +13,11 @@
 
 struct CmdOptions {
     std::string venue; // required
-    std::string base; // --base BTC
-    std::string quote; // --quote USDT
+    std::string base; // --base BTC  (single-symbol mode)
+    std::string quote; // --quote USDT  (single-symbol mode)
+    // F3: multi-symbol — overrides base/quote when present.
+    // Format: "BTC/USDT,ETH/USDT,SOL/USDT"
+    std::optional<std::string> symbols;
     std::optional<int> depthLevel;
     std::optional<std::string> ws_host; // override or std::nullopt
     std::optional<std::string> ws_port; // override or std::nullopt
@@ -74,10 +77,12 @@ inline bool parse_cmdline(int argc, char **argv, CmdOptions &out) {
              "F2: config file path (key=value per line; CLI flags override file values)")
             ("venue,v", po::value<std::string>()->required(),
              "Venue name (binance, okx, bybit, bitget, kucoin)")
-            ("base", po::value<std::string>()->required(),
-             "Base asset, e.g. BTC")
-            ("quote", po::value<std::string>()->required(),
-             "Quote asset, e.g. USDT")
+            ("symbols", po::value<std::string>(),
+             "F3: comma-separated symbol pairs e.g. BTC/USDT,ETH/USDT (overrides --base/--quote)")
+            ("base", po::value<std::string>()->default_value(""),
+             "Base asset, e.g. BTC (single-symbol mode; ignored when --symbols is set)")
+            ("quote", po::value<std::string>()->default_value(""),
+             "Quote asset, e.g. USDT (single-symbol mode; ignored when --symbols is set)")
             ("depthLevel,dl", po::value<int>()->default_value(400),
              "Orderbook depth; required or defaults")
             ("ws_host", po::value<std::string>(),
@@ -159,7 +164,7 @@ inline bool parse_cmdline(int argc, char **argv, CmdOptions &out) {
 
         if (vm.count("help")) {
             std::cout << "Usage: " << argv[0]
-                    << " --venue VENUE --base BTC --quote USDT "
+                    << " --venue VENUE (--symbols BTC/USDT,ETH/USDT | --base BTC --quote USDT) "
                     << "[--depthLevel N] "
                     << "[--ws_host HOST] [--ws_port PORT] [--ws_path PATH] "
                     << "[--rest_host HOST] [--rest_port PORT] [--rest_path PATH] "
@@ -183,6 +188,7 @@ inline bool parse_cmdline(int argc, char **argv, CmdOptions &out) {
     out.venue = vm["venue"].as<std::string>();
     out.base = vm["base"].as<std::string>();
     out.quote = vm["quote"].as<std::string>();
+    if (vm.count("symbols")) out.symbols = vm["symbols"].as<std::string>();
     out.depthLevel = vm["depthLevel"].as<int>();
     if (vm.count("ws_host")) out.ws_host = vm["ws_host"].as<std::string>();
     if (vm.count("ws_port")) out.ws_port = vm["ws_port"].as<std::string>();

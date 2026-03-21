@@ -96,10 +96,23 @@ Larger architectural changes for running at scale or in a high-availability setu
 |---|---|---|---|---|
 | F1 | Mutual TLS (mTLS) between PoP and Brain: PoP presents client cert signed by private CA; brain verifies it | HIGH | ✅ Done | `common/include/connection_handler/WsClient.hpp`, `common/src/connection_handler/WsClient.cpp`, `pop/include/postprocess/WsPublishSink.hpp`, `pop/src/postprocess/WsPublishSink.cpp`, `pop/include/abstract/FeedHandler.hpp`, `pop/include/CmdLine.hpp`, `pop/app/main.cpp`, `pop/src/md/GenericFeedHandler.cpp`, `brain/include/brain/BrainCmdLine.hpp`, `brain/app/brain.cpp` | `--brain_ws_certfile/keyfile` on PoP; `--ca-certfile` on brain; opt-in, backward-compatible |
 | F2 | Configuration file support (YAML/TOML) with CLI overrides; eliminates long command lines for multi-venue deployments | MEDIUM | ✅ Done | `pop/include/CmdLine.hpp`, `brain/include/brain/BrainCmdLine.hpp` | `--config FILE` (key=value format, boost `parse_config_file`); no new deps; CLI overrides file |
-| F3 | Multi-symbol support: one PoP process can track multiple symbols; `FeedHandlerConfig` becomes a symbol list | MEDIUM | ⬜ Not Started | `pop/app/main.cpp`, `pop/src/md/GenericFeedHandler.cpp` |
+| F3 | Multi-symbol support: one PoP process can track multiple symbols; `FeedHandlerConfig` becomes a symbol list | MEDIUM | ✅ Done | `pop/include/CmdLine.hpp`, `pop/app/main.cpp` | `--symbols BTC/USDT,ETH/USDT`; N handlers share one `io_context`; per-symbol persist path derivation; fully backward-compatible with `--base`/`--quote` |
 | F4 | Brain active-passive failover: secondary brain subscribes to same PoPs, promotes on primary failure | LOW | ⬜ Not Started | new component |
 | F5 | Latency pipeline: histogram (p50/p95/p99) of PoP-receive → brain-detected latency per venue pair | LOW | ⬜ Not Started | `brain/src/brain/ArbDetector.cpp` |
 | F6 | Reconnect jitter: ±25% random jitter on all reconnect delays to prevent thundering herd on simultaneous restarts | LOW | ✅ Done | `pop/src/postprocess/WsPublishSink.cpp` | WsPublishSink now uses `mt19937` ±25% jitter matching GenericFeedHandler |
+
+---
+
+## Track G — Concurrency & Scaling
+
+Scaling paths for when symbol count grows or per-message CPU cost increases.
+Current single-threaded `io_context` is correct and sufficient for 2–10 symbols (I/O-bound workload).
+
+| # | Item | Priority | Status | Notes |
+|---|---|---|---|---|
+| G1 | Per-handler thread isolation: one `io_context` + one thread per `GenericFeedHandler`; eliminates single-thread bottleneck for 20+ symbols without strand refactoring | MEDIUM | ⬜ Not Started | Preferred scaling path; each handler fully isolated; join all threads on exit |
+| G2 | Thread-pool `io_context`: call `ioc.run()` from N threads to parallelise handlers; requires strand protection on `GenericFeedHandler` internal state (`state_`, `buffer_`, counters) | LOW | ⬜ Not Started | `WsClient`/`RestClient` already strand-safe; `GenericFeedHandler` is not yet |
+| G3 | CPU offload: move JSON parsing off the I/O thread onto a `thread_pool`; post results back via `dispatch()`; eliminates parse latency without touching handler state model | LOW | ⬜ Not Started | Worthwhile if symbol count grows beyond ~20 or heavier per-message analytics are added |
 
 ---
 
@@ -109,6 +122,34 @@ Larger architectural changes for running at scale or in a high-availability setu
 - When complete: change `🔄 In Progress` → `✅ Done`
 - Add new items as they are identified, in the appropriate track
 - Do not delete completed rows — they serve as a change history
+
+---
+
+## Batch 6 — ✅ Complete (2026-03-21)
+
+WsClient/RestClient bug fixes (4 bugs) + F3 multi-symbol PoP support.
+
+| # | Item | Status |
+|---|---|---|
+| Bug 1 | WsClient: missing `closing_` guard in `do_ws_handshake_()` callback (race: could set `opened_=true` on a connection that should tear down) | ✅ Done |
+| Bug 2 | WsClient: duplicate state reset in `connect()` — `opened_=false` and `close_notified_.store(false)` were set twice | ✅ Done |
+| Bug 3 | WsClient: `set_client_cert()` raw OpenSSL calls (`SSL_use_certificate_chain_file`, `SSL_use_PrivateKey_file`) had no return-value check; bad cert/key silently ignored | ✅ Done |
+| Bug 4 | RestClient: HTTP non-2xx responses used `errc::protocol_error` (EPROTO); replaced with custom `http_errc::non_2xx` category | ✅ Done |
+| F3 | Multi-symbol: `--symbols BTC/USDT,ETH/USDT`; N `GenericFeedHandler`s share one `io_context`; per-symbol persist path derivation; backward-compatible | ✅ Done |
+
+---
+
+## Batch 5 — ✅ Complete (2026-03-21)
+
+First full end-to-end run on macOS + Boost 1.88. Three platform-compatibility fixes and one latent mTLS bug fixed. No new features; no TODO items changed status.
+
+| # | Item | Status |
+|---|---|---|
+| — | `ssl::rfc2818_verification` → `ssl::host_name_verification` (removed in Boost 1.88) | ✅ Done |
+| — | CMakeLists: guard RELRO/PIE linker flags with `if(NOT APPLE)` | ✅ Done |
+| — | `timer.cancel(ignored)` → `timer.cancel()` (overload removed in Boost 1.88) | ✅ Done |
+| — | mTLS client cert bug: `set_client_cert()` now sets cert on both `ssl_ctx_` and the stream's native SSL handle | ✅ Done |
+| — | All 5 PoP configs: `brain_ws_insecure=true` for local dev (CA not in system trust store) | ✅ Done |
 
 ---
 

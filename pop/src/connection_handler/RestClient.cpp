@@ -349,8 +349,10 @@ namespace md {
 
                                            self->final_ec_.clear();
                                            if (self->last_http_status_ < 200 || self->last_http_status_ >= 300) {
-                                               // Preserve body (venues often put details there)
-                                               self->final_ec_ = make_error_code(boost::system::errc::protocol_error);
+                                               // Preserve body (venues often put details there).
+                                               // Use http_errc::non_2xx so callers can distinguish an
+                                               // exchange-level error from a transport/TLS failure.
+                                               self->final_ec_ = make_error_code(http_errc::non_2xx);
                                            }
 
                                            // If keep-alive is enabled AND server agrees AND no error, do not TLS-shutdown.

@@ -86,8 +86,7 @@ namespace md {
         running_ = false;
         reconnect_scheduled_ = false;
         reconnect_gen_++;
-        boost::system::error_code ignored;
-        reconnect_timer_.cancel(ignored);
+        reconnect_timer_.cancel();
         if (ws_) ws_->close();
     }
 

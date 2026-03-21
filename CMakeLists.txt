@@ -30,7 +30,9 @@ if(NOT MSVC)
         -fPIE
         $<$<NOT:$<CONFIG:Debug>>:-D_FORTIFY_SOURCE=2>
     )
-    add_link_options(-pie -Wl,-z,relro,-z,now)
+    if(NOT APPLE)
+        add_link_options(-pie -Wl,-z,relro,-z,now)
+    endif()
 endif()
 
 # ---- Sanitizer options (off by default; enable for dev/CI) ----
