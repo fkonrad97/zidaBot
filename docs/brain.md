@@ -16,8 +16,9 @@ Parsed by `brain/include/brain/BrainCmdLine.hpp` into `BrainOptions`.
 |---|---|---|---|
 | `--bind` | `0.0.0.0` | No | Bind address |
 | `--port` | `8443` | No | Listen port (WSS) |
-| `--certfile` | — | **Yes** | TLS certificate PEM file |
-| `--keyfile` | — | **Yes** | TLS private key PEM file |
+| `--certfile` | — | **Yes** | TLS server certificate PEM file |
+| `--keyfile` | — | **Yes** | TLS server private key PEM file |
+| `--ca-certfile` | — | No | F1: mTLS CA certificate PEM — require PoP clients to present a cert signed by this CA |
 | `--output` | — | No | Arb signal output JSONL file path |
 | `--min-spread-bps` | `0.0` | No | Only emit crosses at or above this threshold in bps (0 = all) |
 | `--max-spread-bps` | `0.0` | No | Suppress crosses above this threshold (0 = no cap); logged as anomalies |
@@ -27,13 +28,10 @@ Parsed by `brain/include/brain/BrainCmdLine.hpp` into `BrainOptions`.
 | `--depth` | `50` | No | Order book depth per venue |
 | `--output-max-mb` | `0` | No | Rotate `--output` file at this size in MB (0 = no rotation); rotated files are renamed `.1`, `.2`, … |
 | `--watchdog-no-cross-sec` | `0` | No | Warn on stderr if no arb cross is emitted for this many seconds while ≥ 2 venues are synced (0 = off) |
+| `--log-level` | `info` | No | D1: Log verbosity: `debug` \| `info` \| `warn` \| `error` |
+| `--config` | — | No | F2: Config file path (key=value per line; CLI flags override file values). See `config/brain.conf` for an example. |
 
-**Generating a self-signed cert for local dev:**
-
-```bash
-openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
-  -keyout /tmp/brain_key.pem -out /tmp/brain_cert.pem -subj "/CN=localhost"
-```
+**TLS / mTLS cert setup:** see [docs/HOWTO.md § 3](HOWTO.md#3-tls--mtls-certificate-setup) for full instructions (self-signed dev cert and full mTLS CA setup).
 
 ---
 
@@ -246,29 +244,24 @@ PoP instance C (bybit)   ──┘
 ## Running
 
 ```bash
-# Generate self-signed cert (once)
-openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
-  -keyout /tmp/brain_key.pem -out /tmp/brain_cert.pem -subj "/CN=localhost"
+# Start brain using config file (recommended — see config/brain.conf)
+./build/brain/brain --config config/brain.conf
 
-# Start brain
+# Or with explicit flags
 ./build/brain/brain \
   --port 8443 \
-  --certfile /tmp/brain_cert.pem \
-  --keyfile  /tmp/brain_key.pem \
+  --certfile /tmp/certs/brain_cert.pem \
+  --keyfile  /tmp/certs/brain_key.pem \
+  --ca-certfile /tmp/certs/ca_cert.pem \
   --output   /tmp/arb.jsonl \
   --min-spread-bps 0 \
   --depth 50
 
-# Start PoP (in separate terminals, one per venue)
-./build/pop/pop --venue binance --base BTC --quote USDT \
-  --brain_ws_host 127.0.0.1 --brain_ws_port 8443 --brain_ws_path / \
-  --brain_ws_insecure \
-  --persist_book_every_updates 1000 --persist_book_top 50
-
-./build/pop/pop --venue okx --base BTC --quote USDT \
-  --brain_ws_host 127.0.0.1 --brain_ws_port 8443 --brain_ws_path / \
-  --brain_ws_insecure \
-  --persist_book_every_updates 1000 --persist_book_top 50
+# Start PoP (in separate terminals, one per venue — see config/*.conf)
+./build/pop/pop --config config/binance.conf
+./build/pop/pop --config config/okx.conf
 ```
 
 Arb crosses appear on brain's stderr and in `/tmp/arb.jsonl`.
+
+See [docs/HOWTO.md](HOWTO.md) for the full end-to-end setup guide including mTLS cert generation.

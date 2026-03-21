@@ -44,7 +44,9 @@ Disabled when `--brain_ws_host` is absent.
 | `--brain_ws_host` | — | Brain server hostname or IP |
 | `--brain_ws_port` | — | Brain server port (e.g. `8443`) |
 | `--brain_ws_path` | — | WebSocket path (e.g. `/`) |
-| `--brain_ws_insecure` | false | Disable TLS cert verification (local dev only) |
+| `--brain_ws_insecure` | false | Disable TLS cert verification (local dev only — never use in production) |
+| `--brain_ws_certfile` | — | F1: mTLS client certificate PEM file for PoP→brain connection |
+| `--brain_ws_keyfile` | — | F1: mTLS client private key PEM file for PoP→brain connection |
 
 ### Persistence (optional)
 
@@ -72,7 +74,14 @@ Disabled when `--brain_ws_host` is absent.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--log_path` | — | Redirect process log to file (`.log` appended if no extension) |
+| `--log_level` | `info` | D1: Log verbosity: `debug` \| `info` \| `warn` \| `error` |
+| `--log_path` | — | D1: Write log to file in addition to stderr (`.log` appended if no extension) |
+
+### Configuration file
+
+| Flag | Default | Description |
+|---|---|---|
+| `--config` | — | F2: Config file path (key=value per line; CLI flags override file values). See `config/*.conf` for examples. |
 
 ### Debug flags
 
