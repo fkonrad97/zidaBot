@@ -128,6 +128,33 @@ serialised as JSON text frames, which is human-readable but CPU-heavy on both en
 
 ---
 
+## Track I — Python Backtest Environment
+
+Expose the C++ arb detection engine to Python via pybind11 for replaying historical
+JSONL data and strategy research. Full design in `docs/backtest.md`.
+
+| # | Item | Priority | Status | Notes |
+|---|---|---|---|---|
+| I1 | `BacktestEngine` C++ class: thin synchronous wrapper around `UnifiedBook` + `ArbDetector`; no threads, no TLS, no file I/O; `feed_event(json_line) → vector<ArbCross>` | HIGH | ⬜ Not Started | `ArbDetector::scan()` already returns `vector<ArbCross>`; production brain ignores it — no existing code changes needed |
+| I2 | pybind11 binding module (`python/zidabot.cpp`): expose `BacktestEngine`, `ArbCross`, `BBO`; `pybind11/stl.h` for automatic `vector<ArbCross>` → `list[ArbCross]` | HIGH | ⬜ Not Started | FetchContent pybind11 v2.13.1; `pybind11_add_module(zidabot ...)`; build with `--target zidabot` |
+| I3 | `python/example_backtest.py`: minimal working replay script (JSONL/.gz → pandas DataFrame); ships as usage reference | MEDIUM | ⬜ Not Started | Depends on I1 + I2 |
+| I4 | Depth curve access: expose full bid/ask level arrays per venue per event for feature engineering (spread series, book imbalance, etc.) | LOW | ⬜ Not Started | Requires binding `OrderBook::bid_ptr(i)` / `ask_ptr(i)`; defer until basic API is proven |
+
+---
+
+## Batch 10 — ⬜ Planned
+
+Python backtest environment (Track I, items I1 + I2 + I3).
+
+| # | Item | Status |
+|---|---|---|
+| I1 | `brain/include/brain/BacktestEngine.hpp` + `brain/src/brain/BacktestEngine.cpp` | ⬜ |
+| I2 | `python/zidabot.cpp` pybind11 module + `python/CMakeLists.txt` + FetchContent pybind11 | ⬜ |
+| I3 | `python/example_backtest.py` replay script | ⬜ |
+| — | Add `add_subdirectory(python)` to root `CMakeLists.txt` | ⬜ |
+
+---
+
 ## Batch 9 — ✅ Complete (2026-03-22)
 
 G1 per-handler thread isolation + H1 MessagePack wire format.
