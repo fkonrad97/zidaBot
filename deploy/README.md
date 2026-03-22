@@ -59,11 +59,15 @@ Example brain response:
     {"venue": "binance", "symbol": "BTCUSDT", "state": "synced", "feed_healthy": true, "age_ms": 120}
   ],
   "last_cross_s_ago": 8.4,
-  "ws_clients": 5
+  "ws_clients": 5,
+  "standby": false,
+  "latency_us": {"p50": 900, "p95": 3500, "p99": 8000, "n": 1240}
 }
 ```
 
-`ok: false` means no venues are synced. `ok: true` means all registered venues are synced.
+`ok: false` means not all venues are synced. `ok: true` means all registered venues are synced.
+`standby: true` means the brain is in passive mode (F4) — receiving data but not emitting signals.
+`latency_us` is null until the first arb cross is detected (F5).
 
 ## systemd (Linux)
 

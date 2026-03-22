@@ -159,11 +159,10 @@ namespace md {
 
     void WsPublishSink::send_json_(const nlohmann::json &j) noexcept {
         try {
-            // ts_persist_ns in the payload marks the time this message was enqueued,
-            // not the time it was actually written to the socket.  Under a backlogged
-            // outbox the two can diverge by several seconds.
-            const std::string payload = j.dump();
-            ws_->send_text(payload);
+            // H1: serialize as MessagePack binary instead of JSON text.
+            // nlohmann/json::to_msgpack() has zero additional dependencies.
+            const auto bytes = nlohmann::json::to_msgpack(j);
+            ws_->send_binary(std::string(bytes.begin(), bytes.end()));
         } catch (...) {
             // Best-effort; keep feed alive even if publishing fails.
         }

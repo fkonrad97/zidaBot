@@ -25,6 +25,7 @@ struct BrainOptions {
     std::int64_t watchdog_no_cross_sec{0};    ///< D4: warn if no cross in this many seconds (0 = disabled)
     std::size_t depth{50};      ///< OrderBook depth per venue
     uint16_t    health_port{0};   ///< D5: plain-HTTP health endpoint port (0 = disabled)
+    bool        standby{false};   ///< F4: start in passive standby mode (no signal emission)
     bool        show_help{false};
 };
 
@@ -67,7 +68,10 @@ inline bool parse_brain_cmdline(int argc, char **argv, BrainOptions &out) {
         ("log-level",     po::value<std::string>()->default_value("info"),
                           "D1: log verbosity: debug | info | warn | error")
         ("health-port",   po::value<uint16_t>()->default_value(0),
-                          "D5: plain-HTTP health endpoint port (0 = disabled); e.g. 8081");
+                          "D5: plain-HTTP health endpoint port (0 = disabled); e.g. 8081")
+        ("standby",       po::bool_switch()->default_value(false),
+                          "F4: start in passive standby mode — receives data but emits no signals; "
+                          "promote to active with SIGUSR1");
 
     po::variables_map vm;
     try {
@@ -109,6 +113,7 @@ inline bool parse_brain_cmdline(int argc, char **argv, BrainOptions &out) {
     out.depth         = vm["depth"].as<std::size_t>();
     out.log_level = vm["log-level"].as<std::string>();
     out.health_port = vm["health-port"].as<uint16_t>();
+    out.standby     = vm["standby"].as<bool>();
     if (vm.count("certfile"))   out.certfile   = vm["certfile"].as<std::string>();
     if (vm.count("keyfile"))    out.keyfile    = vm["keyfile"].as<std::string>();
     if (vm.count("ca-certfile")) out.ca_certfile = vm["ca-certfile"].as<std::string>();

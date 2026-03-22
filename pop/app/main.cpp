@@ -22,6 +22,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -122,6 +123,12 @@ static md::FeedHandlerConfig build_cfg(const CmdOptions &options,
     cfg.brain_ws_insecure = options.brain_ws_insecure;
     cfg.brain_ws_certfile = options.brain_ws_certfile.value_or("");
     cfg.brain_ws_keyfile  = options.brain_ws_keyfile.value_or("");
+    cfg.brain2_ws_host     = options.brain2_ws_host.value_or("");
+    cfg.brain2_ws_port     = options.brain2_ws_port.value_or("");
+    cfg.brain2_ws_path     = options.brain2_ws_path.value_or("");
+    cfg.brain2_ws_insecure = options.brain2_ws_insecure;
+    cfg.brain2_ws_certfile = options.brain2_ws_certfile.value_or("");
+    cfg.brain2_ws_keyfile  = options.brain2_ws_keyfile.value_or("");
     cfg.persist_path               = persist_path;
     cfg.persist_book_every_updates = static_cast<std::size_t>(options.persist_book_every_updates);
     cfg.persist_book_top           = static_cast<std::size_t>(options.persist_book_top);
@@ -134,6 +141,10 @@ static md::FeedHandlerConfig build_cfg(const CmdOptions &options,
     if (!cfg.brain_ws_host.empty()) {
         if (cfg.brain_ws_port.empty()) cfg.brain_ws_port = "443";
         if (cfg.brain_ws_path.empty()) cfg.brain_ws_path = "/";
+    }
+    if (!cfg.brain2_ws_host.empty()) {
+        if (cfg.brain2_ws_port.empty()) cfg.brain2_ws_port = "443";
+        if (cfg.brain2_ws_path.empty()) cfg.brain2_ws_path = "/";
     }
 
     // Symbol mapping.
@@ -241,11 +252,25 @@ int main(int argc, char **argv) {
 
     // -------------------------------------------------------------------------
     // 5) Create and start one GenericFeedHandler per symbol
+    //    G1: each handler gets its own io_context + std::thread so feeds are
+    //    fully isolated — one slow venue cannot stall the others.
     // -------------------------------------------------------------------------
-    boost::asio::io_context ioc;
     const auto start_time = std::chrono::steady_clock::now();
 
-    std::vector<std::unique_ptr<md::GenericFeedHandler>> handlers;
+    // main_ioc: used only for HealthServer + signal_set.
+    boost::asio::io_context main_ioc;
+
+    // One io_context per handler, plus a work guard so each ioc doesn't exit
+    // before we explicitly tell it to stop.
+    using WorkGuard = boost::asio::executor_work_guard<
+        boost::asio::io_context::executor_type>;
+
+    std::vector<std::unique_ptr<boost::asio::io_context>> handler_iocs;
+    std::vector<WorkGuard>                                 work_guards;
+    std::vector<std::unique_ptr<md::GenericFeedHandler>>  handlers;
+
+    handler_iocs.reserve(symbols.size());
+    work_guards.reserve(symbols.size());
     handlers.reserve(symbols.size());
 
     for (const auto &[base, quote] : symbols) {
@@ -259,7 +284,11 @@ int main(int argc, char **argv) {
                      base, quote, cfg.symbol,
                      persist_path.empty() ? "<disabled>" : persist_path);
 
-        auto h = std::make_unique<md::GenericFeedHandler>(ioc);
+        handler_iocs.push_back(std::make_unique<boost::asio::io_context>());
+        work_guards.emplace_back(
+            boost::asio::make_work_guard(*handler_iocs.back()));
+
+        auto h = std::make_unique<md::GenericFeedHandler>(*handler_iocs.back());
         auto st = h->init(cfg);
         if (st != md::FeedOpResult::OK) {
             spdlog::error("[MAIN] init failed for {}/{}", base, quote);
@@ -273,11 +302,19 @@ int main(int argc, char **argv) {
         handlers.push_back(std::move(h));
     }
 
-    spdlog::info("[MAIN] {} handler{} started — entering io_context loop",
+    // Spawn one thread per handler io_context.
+    std::vector<std::thread> handler_threads;
+    handler_threads.reserve(handler_iocs.size());
+    for (auto &ioc_ptr : handler_iocs) {
+        handler_threads.emplace_back([ptr = ioc_ptr.get()] { ptr->run(); });
+    }
+
+    spdlog::info("[MAIN] {} handler{} started — each on its own thread",
                  handlers.size(), handlers.size() == 1 ? "" : "s");
 
-    // ---- D5: Health endpoint ----
-    md::HealthServer health_server(ioc, options.health_port, [&]() -> std::string {
+    // ---- D5: Health endpoint (runs on main_ioc) ----
+    // state_/ctr_resyncs_ are atomic — safe to read cross-thread.
+    md::HealthServer health_server(main_ioc, options.health_port, [&]() -> std::string {
         using nlohmann::json;
         const auto uptime_s = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - start_time).count();
@@ -302,17 +339,27 @@ int main(int argc, char **argv) {
     });
     health_server.start();
 
-    // ---- Signal handling (SIGTERM / SIGINT) ----
-    boost::asio::signal_set signals(ioc, SIGINT, SIGTERM);
+    // ---- Signal handling (SIGTERM / SIGINT) on main_ioc ----
+    boost::asio::signal_set signals(main_ioc, SIGINT, SIGTERM);
     signals.async_wait([&](const boost::system::error_code &, int) {
         spdlog::info("[POP] shutting down");
         health_server.stop();
-        for (auto &h : handlers) h->stop();
-        ioc.stop();
+        // Post stop() to each handler's own thread, then release the work
+        // guard so its ioc can drain and exit cleanly.
+        for (std::size_t i = 0; i < handlers.size(); ++i) {
+            boost::asio::post(*handler_iocs[i],
+                              [&h = *handlers[i]] { h.stop(); });
+            work_guards[i].reset();
+        }
+        main_ioc.stop();
         md::log::flush();
     });
 
-    ioc.run();
+    main_ioc.run();
+
+    // Wait for all handler threads to finish draining.
+    for (auto &t : handler_threads) t.join();
+
     md::log::flush();
     return 0;
 }

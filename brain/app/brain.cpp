@@ -1,4 +1,5 @@
 #include <csignal>
+#include <unistd.h>
 
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/address.hpp>
@@ -76,16 +77,30 @@ int main(int argc, char **argv) {
         opts.output,
         output_max_bytes
     );
+    // F4: standby mode — suppress signal emission until promoted via SIGUSR1
+    if (opts.standby) {
+        arb.set_active(false);
+        spdlog::warn("[brain] starting in STANDBY mode — promote with: kill -USR1 {}", ::getpid());
+    }
 
     // ---- Message callback ----
-    auto on_message = [&](std::string_view msg) {
+    // H1: PoP sends MessagePack binary frames; fall back to JSON text for
+    // backward compatibility during mixed-version deployments.
+    auto on_message = [&](std::string_view msg, bool is_binary) {
         try {
-            const auto j = nlohmann::json::parse(msg);
+            nlohmann::json j;
+            if (is_binary) {
+                j = nlohmann::json::from_msgpack(
+                        reinterpret_cast<const uint8_t *>(msg.data()),
+                        reinterpret_cast<const uint8_t *>(msg.data()) + msg.size());
+            } else {
+                j = nlohmann::json::parse(msg);
+            }
             const std::string updated = book.on_event(j);
             if (!updated.empty() && book.synced_count() >= 2)
                 arb.scan(book.venues());
         } catch (const nlohmann::json::exception &e) {
-            spdlog::warn("[brain] JSON parse error: {}", e.what());
+            spdlog::warn("[brain] parse error: {}", e.what());
         } catch (...) {}
     };
 
@@ -173,6 +188,16 @@ int main(int argc, char **argv) {
             j["last_cross_s_ago"] = nullptr;
 
         j["ws_clients"] = server.session_count();
+        j["standby"]    = !arb.is_active(); // F4: true when in passive standby mode
+
+        // F5: detection latency percentiles (null when no crosses yet)
+        if (!arb.latency_percentiles().n) {
+            j["latency_us"] = nullptr;
+        } else {
+            const auto lp = arb.latency_percentiles();
+            j["latency_us"] = {{"p50", lp.p50_us}, {"p95", lp.p95_us},
+                               {"p99", lp.p99_us}, {"n",   lp.n}};
+        }
         return j.dump();
     });
     health_server.start();
@@ -187,6 +212,14 @@ int main(int argc, char **argv) {
         server.stop();
         ioc.stop();
         md::log::flush();
+    });
+
+    // F4: SIGUSR1 promotes standby brain to active
+    boost::asio::signal_set promote_signal(ioc, SIGUSR1);
+    promote_signal.async_wait([&](const boost::system::error_code &ec, int) {
+        if (ec) return;
+        arb.set_active(true);
+        spdlog::warn("[brain] PROMOTED to active (SIGUSR1 received)");
     });
 
     spdlog::info("[brain] running depth={} min_spread={}bps max_spread={} rate_limit={} "

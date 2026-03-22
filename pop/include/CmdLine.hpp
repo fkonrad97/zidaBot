@@ -31,6 +31,13 @@ struct CmdOptions {
     bool brain_ws_insecure{false}; // disable TLS verification (local testing)
     std::optional<std::string> brain_ws_certfile; // F1: mTLS client cert PEM
     std::optional<std::string> brain_ws_keyfile;  // F1: mTLS client key PEM
+    // F4: secondary brain connection for active-passive failover
+    std::optional<std::string> brain2_ws_host;
+    std::optional<std::string> brain2_ws_port;
+    std::optional<std::string> brain2_ws_path;
+    bool brain2_ws_insecure{false};
+    std::optional<std::string> brain2_ws_certfile;
+    std::optional<std::string> brain2_ws_keyfile;
     std::optional<std::string> persist_path; // optional JSONL persistence file
     std::optional<std::string> log_path; // optional process log file path
     int persist_book_every_updates{0}; // 0 = disabled
@@ -110,6 +117,18 @@ inline bool parse_cmdline(int argc, char **argv, CmdOptions &out) {
              "F1: mTLS client certificate PEM file for PoP->brain connection")
             ("brain_ws_keyfile", po::value<std::string>(),
              "F1: mTLS client private key PEM file for PoP->brain connection")
+            ("brain2_ws_host", po::value<std::string>(),
+             "F4: secondary brain WS host for active-passive failover")
+            ("brain2_ws_port", po::value<std::string>(),
+             "F4: secondary brain WS port")
+            ("brain2_ws_path", po::value<std::string>(),
+             "F4: secondary brain WS path, e.g. /")
+            ("brain2_ws_insecure", po::bool_switch()->default_value(false),
+             "F4: secondary brain: disable TLS cert/host check (local testing only)")
+            ("brain2_ws_certfile", po::value<std::string>(),
+             "F4: secondary brain mTLS client cert PEM")
+            ("brain2_ws_keyfile", po::value<std::string>(),
+             "F4: secondary brain mTLS client key PEM")
             ("persist_path", po::value<std::string>(),
              "Optional persistence output file path (JSONL)")
             ("log_path", po::value<std::string>(),
@@ -205,6 +224,12 @@ inline bool parse_cmdline(int argc, char **argv, CmdOptions &out) {
     out.brain_ws_insecure = vm["brain_ws_insecure"].as<bool>();
     if (vm.count("brain_ws_certfile")) out.brain_ws_certfile = vm["brain_ws_certfile"].as<std::string>();
     if (vm.count("brain_ws_keyfile"))  out.brain_ws_keyfile  = vm["brain_ws_keyfile"].as<std::string>();
+    if (vm.count("brain2_ws_host"))    out.brain2_ws_host    = vm["brain2_ws_host"].as<std::string>();
+    if (vm.count("brain2_ws_port"))    out.brain2_ws_port    = vm["brain2_ws_port"].as<std::string>();
+    if (vm.count("brain2_ws_path"))    out.brain2_ws_path    = vm["brain2_ws_path"].as<std::string>();
+    out.brain2_ws_insecure = vm["brain2_ws_insecure"].as<bool>();
+    if (vm.count("brain2_ws_certfile")) out.brain2_ws_certfile = vm["brain2_ws_certfile"].as<std::string>();
+    if (vm.count("brain2_ws_keyfile"))  out.brain2_ws_keyfile  = vm["brain2_ws_keyfile"].as<std::string>();
     if (vm.count("persist_path")) out.persist_path = vm["persist_path"].as<std::string>();
     if (vm.count("log_path")) out.log_path = vm["log_path"].as<std::string>();
     out.persist_book_every_updates = std::max(0, vm["persist_book_every_updates"].as<int>());

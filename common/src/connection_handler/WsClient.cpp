@@ -262,7 +262,21 @@ namespace md {
             while (self->outbox_.size() >= self->max_outbox_) {
                 self->outbox_.pop_front();
             }
-            self->outbox_.push_back(std::move(text));
+            self->outbox_.push_back({std::move(text), false});
+            if (self->opened_) self->start_write_();
+        });
+    }
+
+    void WsClient::send_binary(std::string data) {
+        auto self = shared_from_this();
+        boost::asio::dispatch(strand_, [self, data = std::move(data)]() mutable {
+            if (self->closing_) return;
+
+            if (self->max_outbox_ == 0) return;
+            while (self->outbox_.size() >= self->max_outbox_) {
+                self->outbox_.pop_front();
+            }
+            self->outbox_.push_back({std::move(data), true});
             if (self->opened_) self->start_write_();
         });
     }
@@ -279,9 +293,12 @@ namespace md {
         if (outbox_.empty()) return;
         write_in_flight_ = true;
 
+        // H1: set text/binary opcode per frame.
+        ws_.text(!outbox_.front().binary);
+
         auto self = shared_from_this();
         ws_.async_write(
-            boost::asio::buffer(outbox_.front()),
+            boost::asio::buffer(outbox_.front().data),
             boost::asio::bind_executor(strand_,
                                        [self](const beast::error_code &ec, std::size_t) {
                                            self->write_in_flight_ = false;

@@ -66,8 +66,16 @@ void ArbDetector::rotate_output_() {
 }
 
 void ArbDetector::emit_(const ArbCross &c) {
+    // F4: standby mode — build state but suppress emission
+    if (!active_.load(std::memory_order_relaxed)) return;
+
     ++crosses_total_;
     last_cross_ns_ = c.ts_detected_ns;
+
+    // F5: record detection latency (time from freshest book update to detection)
+    const std::int64_t lag_ns =
+        c.ts_detected_ns - std::max(c.sell_ts_book_ns, c.buy_ts_book_ns);
+    if (lag_ns > 0) latency_hist_.record(lag_ns);
 
     spdlog::info("[ARB] sell={} bid={} buy={} ask={} spread={}bps",
                  c.sell_venue, c.sell_bid_tick, c.buy_venue, c.buy_ask_tick, c.spread_bps);
@@ -84,6 +92,7 @@ void ArbDetector::emit_(const ArbCross &c) {
         j["spread_bps"]      = c.spread_bps;
         j["sell_ts_book_ns"] = c.sell_ts_book_ns;
         j["buy_ts_book_ns"]  = c.buy_ts_book_ns;
+        j["lag_ns"]          = lag_ns; // F5: detection latency for offline analysis
         const std::string line = j.dump() + '\n';
         output_ << line;
         output_.flush();

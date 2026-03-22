@@ -62,30 +62,31 @@ namespace md
 
     void GenericFeedHandler::set_state_(FeedSyncState next, std::string_view reason)
     {
-        if (state_ == next)
+        const FeedSyncState cur = state_.load(std::memory_order_relaxed);
+        if (cur == next)
             return;
         if (reason.empty()) {
             spdlog::info("[GFH] state {} -> {} venue={}",
-                         sync_state_to_string_(state_), sync_state_to_string_(next), to_string(rt_.venue));
+                         sync_state_to_string_(cur), sync_state_to_string_(next), to_string(rt_.venue));
         } else {
             spdlog::info("[GFH] state {} -> {} venue={} reason={}",
-                         sync_state_to_string_(state_), sync_state_to_string_(next), to_string(rt_.venue), reason);
+                         sync_state_to_string_(cur), sync_state_to_string_(next), to_string(rt_.venue), reason);
         }
-        state_ = next;
+        state_.store(next, std::memory_order_relaxed);
 
         // B6: reset reconnect backoff once we successfully reach SYNCED
         if (next == FeedSyncState::SYNCED) {
             reset_reconnect_delay_();
         }
 
-        if (brain_publish_) {
+        if (!brain_sinks_.empty()) {
             std::string_view feed_state;
             switch (next) {
                 case FeedSyncState::DISCONNECTED: feed_state = "disconnected"; break;
                 case FeedSyncState::SYNCED:       feed_state = "synced";       break;
                 default:                          feed_state = "resyncing";    break;
             }
-            brain_publish_->publish_status(feed_state, reason);
+            for (auto &s : brain_sinks_) s->publish_status(feed_state, reason);
         }
     }
 
@@ -188,23 +189,21 @@ namespace md
             }
         }
 
-        brain_publish_.reset();
-        if (!cfg_.brain_ws_host.empty())
-        {
-            const std::string host = cfg_.brain_ws_host;
-            const std::string port = cfg_.brain_ws_port;  // defaults applied in main.cpp
-            const std::string path = cfg_.brain_ws_path;  // defaults applied in main.cpp
-            brain_publish_ = std::make_unique<WsPublishSink>(ioc_,
-                                                            host,
-                                                            port,
-                                                            path,
-                                                            cfg_.brain_ws_insecure,
-                                                            to_string(rt_.venue),
-                                                            cfg_.symbol,
-                                                            cfg_.brain_ws_certfile,
-                                                            cfg_.brain_ws_keyfile);
+        brain_sinks_.clear();
+        auto add_sink_ = [&](const std::string &host, const std::string &port,
+                              const std::string &path, bool insecure,
+                              const std::string &certfile, const std::string &keyfile) {
+            brain_sinks_.push_back(std::make_unique<WsPublishSink>(
+                ioc_, host, port, path, insecure,
+                to_string(rt_.venue), cfg_.symbol, certfile, keyfile));
             spdlog::info("[GFH] brain publish enabled: {}:{}{}", host, port, path);
-        }
+        };
+        if (!cfg_.brain_ws_host.empty())
+            add_sink_(cfg_.brain_ws_host,  cfg_.brain_ws_port,  cfg_.brain_ws_path,
+                      cfg_.brain_ws_insecure,  cfg_.brain_ws_certfile,  cfg_.brain_ws_keyfile);
+        if (!cfg_.brain2_ws_host.empty())
+            add_sink_(cfg_.brain2_ws_host, cfg_.brain2_ws_port, cfg_.brain2_ws_path,
+                      cfg_.brain2_ws_insecure, cfg_.brain2_ws_certfile, cfg_.brain2_ws_keyfile);
 
         buffer_.clear();
         set_state_(FeedSyncState::DISCONNECTED, "init");
@@ -245,7 +244,7 @@ namespace md
 
         connect_id_ = makeConnectId();
 
-        if (brain_publish_) brain_publish_->start();
+        for (auto &s : brain_sinks_) s->start();
 
         if (rt_.caps.requires_ws_bootstrap)
         {
@@ -267,8 +266,7 @@ namespace md
             rest_->cancel();
         if (ws_)
             ws_->close();
-        if (brain_publish_)
-            brain_publish_->stop();
+        for (auto &s : brain_sinks_) s->stop();
         disarm_ws_watchdog_();
         heartbeat_timer_.cancel();
 
@@ -278,7 +276,7 @@ namespace md
         if (controller_)
             controller_->resetBook();
         persist_.reset();
-        brain_publish_.reset();
+        brain_sinks_.clear();
         persist_book_every_updates_ = 0;
         persist_book_top_ = 0;
         updates_since_book_persist_ = 0;
@@ -495,7 +493,9 @@ namespace md
         last_ws_message_ns_ = recv_ts_ns;
         arm_ws_watchdog_();
 
-        if (state_ == FeedSyncState::WAIT_REST_SNAPSHOT)
+        const FeedSyncState state = state_.load(std::memory_order_relaxed);
+
+        if (state == FeedSyncState::WAIT_REST_SNAPSHOT)
         {
             // buffer incrementals
             const bool isInc = std::visit([&](auto const &a)
@@ -510,7 +510,7 @@ namespace md
             return;
         }
 
-        if (state_ == FeedSyncState::WAIT_WS_SNAPSHOT)
+        if (state == FeedSyncState::WAIT_WS_SNAPSHOT)
         {
             // first, try snapshot
             GenericSnapshotFormat snap;
@@ -531,7 +531,7 @@ namespace md
                 maybe_persist_book_("snapshot_applied");
 
                 // baseline is WS snapshot; any buffered msgs were pre-baseline, drain them now
-                state_ = FeedSyncState::WAIT_BRIDGE;
+                state_.store(FeedSyncState::WAIT_BRIDGE, std::memory_order_relaxed);
                 drainBufferedIncrementals();
                 if (controller_->isSynced())
                     set_state_(FeedSyncState::SYNCED, "ws_snapshot_baseline_ready");
@@ -553,7 +553,7 @@ namespace md
 
         // WAIT_BRIDGE and SYNCED:
         // 1) For WS-authoritative venues, allow an "interrupting" WS snapshot at ANY time and re-baseline.
-        if ((state_ == FeedSyncState::WAIT_BRIDGE || state_ == FeedSyncState::SYNCED) && rt_.caps.ws_sends_snapshot)
+        if ((state == FeedSyncState::WAIT_BRIDGE || state == FeedSyncState::SYNCED) && rt_.caps.ws_sends_snapshot)
         {
             GenericSnapshotFormat snap;
             const bool isSnap = std::visit([&](auto const &a)
@@ -585,10 +585,10 @@ namespace md
         }
 
         // 2) Otherwise: parse + apply incrementals
-        if (state_ == FeedSyncState::WAIT_BRIDGE || state_ == FeedSyncState::SYNCED)
+        if (state == FeedSyncState::WAIT_BRIDGE || state == FeedSyncState::SYNCED)
         {
             // --- RestAnchored: during WAIT_BRIDGE we ONLY buffer+drain ---
-            if (rt_.caps.sync_mode == SyncMode::RestAnchored && state_ == FeedSyncState::WAIT_BRIDGE)
+            if (rt_.caps.sync_mode == SyncMode::RestAnchored && state == FeedSyncState::WAIT_BRIDGE)
             {
                 const bool isInc = std::visit([&](auto const &a)
                                               { return a.isIncremental(msg); }, adapter_);
@@ -634,7 +634,7 @@ namespace md
             ++ctr_book_updates_;
             maybe_persist_book_("incremental_applied");
 
-            if (state_ == FeedSyncState::WAIT_BRIDGE && controller_->isSynced())
+            if (state == FeedSyncState::WAIT_BRIDGE && controller_->isSynced())
             {
                 spdlog::info("[GFH] bridged (ws path) -> SYNCED");
                 set_state_(FeedSyncState::SYNCED, "steady_state_bridge_complete");
@@ -652,12 +652,13 @@ namespace md
             return;
 
         ++ctr_resyncs_;
+        const FeedSyncState cur_state = state_.load(std::memory_order_relaxed);
         if (reason.empty()) {
             spdlog::warn("[GFH] restart sync venue={} state={}",
-                         to_string(rt_.venue), sync_state_to_string_(state_));
+                         to_string(rt_.venue), sync_state_to_string_(cur_state));
         } else {
             spdlog::warn("[GFH] restart sync venue={} state={} reason={}",
-                         to_string(rt_.venue), sync_state_to_string_(state_), reason);
+                         to_string(rt_.venue), sync_state_to_string_(cur_state), reason);
         }
 
         disarm_ws_watchdog_();
@@ -795,7 +796,8 @@ namespace md
             if (ec) return;
             if (!running_.load()) return;
             if (my_gen != ws_watchdog_gen_) return;
-            if (state_ == FeedSyncState::DISCONNECTED || state_ == FeedSyncState::CONNECTING || state_ == FeedSyncState::BOOTSTRAPPING) {
+            const FeedSyncState wdog_state = state_.load(std::memory_order_relaxed);
+            if (wdog_state == FeedSyncState::DISCONNECTED || wdog_state == FeedSyncState::CONNECTING || wdog_state == FeedSyncState::BOOTSTRAPPING) {
                 return;
             }
 
@@ -838,18 +840,18 @@ namespace md
     void GenericFeedHandler::persist_snapshot_(const GenericSnapshotFormat &snap, std::string_view source)
     {
         if (persist_) persist_->write_snapshot(snap, source);
-        if (brain_publish_) brain_publish_->publish_snapshot(snap, source);
+        for (auto &s : brain_sinks_) s->publish_snapshot(snap, source);
     }
 
     void GenericFeedHandler::persist_incremental_(const GenericIncrementalFormat &inc, std::string_view source)
     {
         if (persist_) persist_->write_incremental(inc, source);
-        if (brain_publish_) brain_publish_->publish_incremental(inc, source);
+        for (auto &s : brain_sinks_) s->publish_incremental(inc, source);
     }
 
     void GenericFeedHandler::maybe_persist_book_(std::string_view source)
     {
-        if ((!persist_ && !brain_publish_) || !controller_)
+        if ((!persist_ && brain_sinks_.empty()) || !controller_)
             return;
         if (persist_book_every_updates_ == 0 || persist_book_top_ == 0)
             return;
@@ -870,14 +872,12 @@ namespace md
                                        source,
                                        ts_book_ns);
         }
-        if (brain_publish_)
-        {
-            brain_publish_->publish_book_state(controller_->book(),
-                                               controller_->getAppliedSeqID(),
-                                               persist_book_top_,
-                                               source,
-                                               ts_book_ns);
-        }
+        for (auto &s : brain_sinks_)
+            s->publish_book_state(controller_->book(),
+                                  controller_->getAppliedSeqID(),
+                                  persist_book_top_,
+                                  source,
+                                  ts_book_ns);
     }
 
     // -------------------------------------------------------------------------
@@ -899,10 +899,11 @@ namespace md
     {
         constexpr int kIntervalSec = 60;
         const std::string venue = to_string(rt_.venue);
-        const std::string state = sync_state_to_string_(state_);
+        const std::string state = sync_state_to_string_(state_.load(std::memory_order_relaxed));
         const std::uint64_t msgs_per_sec = ctr_msgs_received_ / kIntervalSec;
         spdlog::info("[HEARTBEAT] venue={} state={} msgs_received={} msgs_per_sec={} book_updates={} resyncs={}",
-                     venue, state, ctr_msgs_received_, msgs_per_sec, ctr_book_updates_, ctr_resyncs_);
+                     venue, state, ctr_msgs_received_, msgs_per_sec, ctr_book_updates_,
+                     ctr_resyncs_.load(std::memory_order_relaxed));
 
         // C2: warn if rate exceeds 2× configured ceiling
         if (cfg_.max_msg_rate_per_sec > 0 &&

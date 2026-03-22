@@ -23,7 +23,8 @@ class WsSession;
 /// WsPublishSink clients and invokes on_message for each received text frame.
 class WsServer {
 public:
-    using MessageHandler = std::function<void(std::string_view)>;
+    // H1: second argument is true when the frame is a binary (MessagePack) frame.
+    using MessageHandler = std::function<void(std::string_view, bool is_binary)>;
 
     WsServer(boost::asio::io_context &ioc,
              boost::asio::ssl::context &ssl_ctx,

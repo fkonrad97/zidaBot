@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <fstream>
 #include <spdlog/spdlog.h>
@@ -7,6 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "brain/LatencyHistogram.hpp"
 #include "brain/UnifiedBook.hpp"
 
 namespace brain {
@@ -48,14 +50,28 @@ public:
     /// and optionally to the output JSONL file. Returns all detected crosses.
     std::vector<ArbCross> scan(const std::vector<VenueBook> &venues);
 
-    /// Flush the output file. Call before shutdown to prevent partial-line loss.
+    /// Flush the output file and log latency stats. Call before shutdown.
     void flush() noexcept {
         if (output_.is_open()) output_.flush();
         spdlog::info("[ArbDetector] total crosses emitted: {}", crosses_total_);
+        if (!latency_hist_.empty()) {
+            const auto p = latency_hist_.compute();
+            spdlog::info("[ArbDetector] detection latency (us) p50={} p95={} p99={} n={}",
+                         p.p50_us, p.p95_us, p.p99_us, p.n);
+        }
     }
 
     /// D4: timestamp of the last emitted cross (0 if none yet).
     [[nodiscard]] std::int64_t last_cross_ns() const noexcept { return last_cross_ns_; }
+
+    /// F4: promote standby brain to active (start emitting signals).
+    void set_active(bool v) noexcept { active_.store(v, std::memory_order_relaxed); }
+    [[nodiscard]] bool is_active() const noexcept { return active_.load(std::memory_order_relaxed); }
+
+    /// F5: p50/p95/p99 detection latency in microseconds.
+    [[nodiscard]] LatencyHistogram::Percentiles latency_percentiles() const {
+        return latency_hist_.compute();
+    }
 
 private:
     static std::int64_t now_ns_() noexcept;
@@ -83,6 +99,8 @@ private:
     std::unordered_map<std::string, std::int64_t> last_emit_ns_; ///< keyed "sell:buy"
     std::uint64_t crosses_total_{0};
     std::int64_t  last_cross_ns_{0};   ///< D4: timestamp of the last emitted cross
+    std::atomic<bool> active_{true};   ///< F4: false = standby mode, suppress emission
+    LatencyHistogram latency_hist_;    ///< F5: detection latency samples
 };
 
 } // namespace brain

@@ -97,8 +97,8 @@ Larger architectural changes for running at scale or in a high-availability setu
 | F1 | Mutual TLS (mTLS) between PoP and Brain: PoP presents client cert signed by private CA; brain verifies it | HIGH | ✅ Done | `common/include/connection_handler/WsClient.hpp`, `common/src/connection_handler/WsClient.cpp`, `pop/include/postprocess/WsPublishSink.hpp`, `pop/src/postprocess/WsPublishSink.cpp`, `pop/include/abstract/FeedHandler.hpp`, `pop/include/CmdLine.hpp`, `pop/app/main.cpp`, `pop/src/md/GenericFeedHandler.cpp`, `brain/include/brain/BrainCmdLine.hpp`, `brain/app/brain.cpp` | `--brain_ws_certfile/keyfile` on PoP; `--ca-certfile` on brain; opt-in, backward-compatible |
 | F2 | Configuration file support (YAML/TOML) with CLI overrides; eliminates long command lines for multi-venue deployments | MEDIUM | ✅ Done | `pop/include/CmdLine.hpp`, `brain/include/brain/BrainCmdLine.hpp` | `--config FILE` (key=value format, boost `parse_config_file`); no new deps; CLI overrides file |
 | F3 | Multi-symbol support: one PoP process can track multiple symbols; `FeedHandlerConfig` becomes a symbol list | MEDIUM | ✅ Done | `pop/include/CmdLine.hpp`, `pop/app/main.cpp` | `--symbols BTC/USDT,ETH/USDT`; N handlers share one `io_context`; per-symbol persist path derivation; fully backward-compatible with `--base`/`--quote` |
-| F4 | Brain active-passive failover: secondary brain subscribes to same PoPs, promotes on primary failure | LOW | ⬜ Not Started | new component |
-| F5 | Latency pipeline: histogram (p50/p95/p99) of PoP-receive → brain-detected latency per venue pair | LOW | ⬜ Not Started | `brain/src/brain/ArbDetector.cpp` |
+| F4 | Brain active-passive failover: secondary brain subscribes to same PoPs, promotes on primary failure | LOW | ✅ Done | `--standby` flag + SIGUSR1 promotion; PoP fan-out via `brain2_ws_*`; health shows `standby: true/false` |
+| F5 | Latency pipeline: histogram (p50/p95/p99) of PoP-receive → brain-detected latency per venue pair | LOW | ✅ Done | `LatencyHistogram` circular buffer; `lag_ns` in JSONL; `latency_us` in health JSON; logged on flush |
 | F6 | Reconnect jitter: ±25% random jitter on all reconnect delays to prevent thundering herd on simultaneous restarts | LOW | ✅ Done | `pop/src/postprocess/WsPublishSink.cpp` | WsPublishSink now uses `mt19937` ±25% jitter matching GenericFeedHandler |
 
 ---
@@ -110,9 +110,51 @@ Current single-threaded `io_context` is correct and sufficient for 2–10 symbol
 
 | # | Item | Priority | Status | Notes |
 |---|---|---|---|---|
-| G1 | Per-handler thread isolation: one `io_context` + one thread per `GenericFeedHandler`; eliminates single-thread bottleneck for 20+ symbols without strand refactoring | MEDIUM | ⬜ Not Started | Preferred scaling path; each handler fully isolated; join all threads on exit |
+| G1 | Per-handler thread isolation: one `io_context` + one thread per `GenericFeedHandler`; eliminates single-thread bottleneck for 20+ symbols without strand refactoring | MEDIUM | ✅ Done | `main_ioc` for health/signals; per-handler ioc+thread; work guards; `state_`/`ctr_resyncs_` made atomic for cross-thread health reads |
 | G2 | Thread-pool `io_context`: call `ioc.run()` from N threads to parallelise handlers; requires strand protection on `GenericFeedHandler` internal state (`state_`, `buffer_`, counters) | LOW | ⬜ Not Started | `WsClient`/`RestClient` already strand-safe; `GenericFeedHandler` is not yet |
 | G3 | CPU offload: move JSON parsing off the I/O thread onto a `thread_pool`; post results back via `dispatch()`; eliminates parse latency without touching handler state model | LOW | ⬜ Not Started | Worthwhile if symbol count grows beyond ~20 or heavier per-message analytics are added |
+| G4 | Brain multithreaded architecture: brain runs `ioc.run()` on one thread; arb scan and JSON parsing compete with I/O callbacks. Options: dedicated scan thread fed by lock-free queue; or strand-per-session (WsServer already uses strands) + separate scan thread owning `UnifiedBook`+`ArbDetector` | MEDIUM | ⬜ Not Started | Only matters at high venue/symbol counts or when scan CPU dominates; measure with F5 latency first |
+
+---
+
+## Track H — Wire Format & Protocol
+
+Performance improvements to the PoP→brain event wire format. Currently all events are
+serialised as JSON text frames, which is human-readable but CPU-heavy on both ends.
+
+| # | Item | Priority | Status | Notes |
+|---|---|---|---|---|
+| H1 | Binary wire format between PoP and Brain: replace `nlohmann::json` serialisation/deserialisation with MessagePack (drop-in, same schema), FlatBuffers (zero-copy, requires schema), or a custom fixed binary layout. Biggest win is on the brain parse side (hot path, single thread). | MEDIUM | ✅ Done | `nlohmann::json::to_msgpack()` / `from_msgpack()` — zero new deps; WS binary frames; backward-compat text-JSON fallback in brain; `send_binary()` added to `WsClient` |
+
+---
+
+## Batch 9 — ✅ Complete (2026-03-22)
+
+G1 per-handler thread isolation + H1 MessagePack wire format.
+
+| # | Item | Status |
+|---|---|---|
+| G1 | `state_` → `std::atomic<FeedSyncState>`; `ctr_resyncs_` → `std::atomic<uint64_t>` — safe cross-thread health reads | ✅ Done |
+| G1 | `main_ioc` (health + signals) + per-handler `io_context` + `std::thread`; work guards; signal posts stop then releases guard | ✅ Done |
+| H1 | `send_binary()` added to `WsClient`; outbox tagged with `{data, bool binary}`; `ws_.text()` set per frame in `do_write_()` | ✅ Done |
+| H1 | `WsPublishSink::send_json_()` → `nlohmann::json::to_msgpack()` + `send_binary()` | ✅ Done |
+| H1 | `WsServer::MessageHandler` → `void(string_view, bool is_binary)`; `WsSession` handles both text+binary frames | ✅ Done |
+| H1 | `brain::on_message` branches on `is_binary`: `from_msgpack()` for binary, `parse()` for text (backward-compat window) | ✅ Done |
+
+---
+
+## Batch 8 — ✅ Complete (2026-03-22)
+
+F4 active-passive brain failover + F5 latency histogram.
+
+| # | Item | Status |
+|---|---|---|
+| F4 | `--standby` flag on brain: receives data, builds state, emits nothing until `kill -USR1 <pid>` | ✅ Done |
+| F4 | PoP `brain2_ws_*` config block: fan-out to primary + standby brain simultaneously | ✅ Done |
+| F4 | SIGUSR1 handler in brain promotes standby → active atomically (no restart needed) | ✅ Done |
+| F5 | `LatencyHistogram`: 10 000-sample circular buffer; p50/p95/p99 via sort on flush/query | ✅ Done |
+| F5 | `lag_ns = ts_detected_ns − max(sell_ts_book_ns, buy_ts_book_ns)` recorded per cross | ✅ Done |
+| F5 | `latency_us` added to brain health JSON; `lag_ns` added to arb JSONL; logged on `flush()` | ✅ Done |
 
 ---
 

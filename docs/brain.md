@@ -29,7 +29,8 @@ Parsed by `brain/include/brain/BrainCmdLine.hpp` into `BrainOptions`.
 | `--output-max-mb` | `0` | No | Rotate `--output` file at this size in MB (0 = no rotation); rotated files are renamed `.1`, `.2`, … |
 | `--watchdog-no-cross-sec` | `0` | No | Warn on stderr if no arb cross is emitted for this many seconds while ≥ 2 venues are synced (0 = off) |
 | `--log-level` | `info` | No | D1: Log verbosity: `debug` \| `info` \| `warn` \| `error` |
-| `--health-port` | `0` | No | D5: Plain-HTTP health endpoint port (0 = disabled). `GET /health` returns JSON with synced venue count, per-venue state, last arb cross time, and active WS client count. |
+| `--health-port` | `0` | No | D5: Plain-HTTP health endpoint port (0 = disabled). `GET /health` returns JSON with synced venue count, per-venue state, last arb cross time, active WS clients, and detection latency percentiles. |
+| `--standby` | false | No | F4: Start in passive standby mode — receives and processes all data but emits no arb signals. Promote to active with `kill -USR1 <pid>`. |
 | `--config` | — | No | F2: Config file path (key=value per line; CLI flags override file values). See `config/brain.conf` for an example. |
 
 **TLS / mTLS cert setup:** see [docs/HOWTO.md § 3](HOWTO.md#3-tls--mtls-certificate-setup) for full instructions (self-signed dev cert and full mTLS CA setup).
@@ -179,8 +180,11 @@ class ArbDetector {
                 double max_price_deviation_pct,
                 std::string output_path, uint64_t output_max_bytes = 0);
     std::vector<ArbCross> scan(const std::vector<VenueBook> &venues);
-    void flush() noexcept;         // flush output file; call before shutdown
-    int64_t last_cross_ns() const; // timestamp of most recent emitted cross (for D4 watchdog)
+    void flush() noexcept;                        // flush file + log latency percentiles; call before shutdown
+    int64_t last_cross_ns() const;                // D4: timestamp of most recent emitted cross
+    void set_active(bool v) noexcept;             // F4: false = standby, suppress emission
+    bool is_active() const noexcept;              // F4: current active state
+    LatencyHistogram::Percentiles latency_percentiles() const; // F5: p50/p95/p99 in µs
 };
 ```
 
@@ -204,13 +208,27 @@ Since `priceTick = price × 100` uniformly across all venues, the ratio is dimen
 
 Crosses above `max_spread_bps` (when `> 0`) are logged as anomalies and suppressed. Per-pair rate limiting (`rate_limit_ns`) drops repeated signals for the same `(sell, buy)` pair within the configured window.
 
+**F4 — Standby mode**
+
+When `--standby` is passed, `active_` starts as `false`. `emit_()` is a no-op when inactive —
+all guard logic (rate limiting, age checks, price sanity) still runs, but no output is produced.
+A `SIGUSR1` handler in `brain.cpp` calls `set_active(true)` atomically; the process immediately
+starts emitting from the next scan. No restart is needed. Health endpoint always shows
+`"standby": true` while inactive and `"standby": false` after promotion.
+
+**F5 — Detection latency**
+
+`lag_ns = ts_detected_ns − max(sell_ts_book_ns, buy_ts_book_ns)` is recorded per cross into a
+`LatencyHistogram` (10 000-sample circular buffer, `brain/include/brain/LatencyHistogram.hpp`).
+p50/p95/p99 in µs are exposed in the health endpoint as `"latency_us"` and logged by `flush()`.
+
 **Output**
 
 Each detected cross is:
 - Printed to stderr.
-- Appended as a JSON line to `--output` if configured.
+- Appended as a JSON line to `--output` if configured. Each line includes `"lag_ns"` (F5).
 - When `--output-max-mb > 0`, the output file is rotated at the configured size: the current file is renamed to `.1` (bumping any existing `.1` → `.2`, etc.) and a fresh file is opened.
-- `flush()` is called in the SIGINT/SIGTERM handler before `ioc.stop()` to prevent partial-line loss on shutdown.
+- `flush()` is called in the SIGINT/SIGTERM handler before `ioc.stop()` to prevent partial-line loss on shutdown. It also logs detection latency percentiles.
 
 ---
 

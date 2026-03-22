@@ -24,7 +24,7 @@ Parsed by `pop/include/CmdLine.hpp` into `CmdOptions`.
 | `--base` + `--quote` | Single-symbol mode. Used when `--symbols` is absent. |
 | `--venue` | **Always required.** Venue name: `binance`, `okx`, `bybit`, `bitget`, `kucoin` |
 
-When `--symbols` is used, each pair spawns an independent `GenericFeedHandler` — all share one `io_context` (single thread, no extra synchronization). Per-symbol persist paths are derived automatically when `--persist_path` is set (e.g. `/tmp/feed.jsonl` → `/tmp/feed_BTC_USDT.jsonl`, `/tmp/feed_ETH_USDT.jsonl`).
+When `--symbols` is used, each pair spawns an independent `GenericFeedHandler`, each on its own `io_context` + `std::thread` (G1 — fully isolated: a slow venue cannot stall others). Per-symbol persist paths are derived automatically when `--persist_path` is set (e.g. `/tmp/feed.jsonl` → `/tmp/feed_BTC_USDT.jsonl`, `/tmp/feed_ETH_USDT.jsonl`).
 
 ### Order book
 
@@ -43,16 +43,31 @@ All default to venue-canonical values. Override only for testing or alternate re
 
 ### Brain publishing (optional)
 
-Disabled when `--brain_ws_host` is absent.
+Disabled when `--brain_ws_host` is absent. PoP can publish to up to two brain instances simultaneously (primary + standby) for F4 active-passive failover.
+
+**Primary brain:**
 
 | Flag | Default | Description |
 |---|---|---|
 | `--brain_ws_host` | — | Brain server hostname or IP |
-| `--brain_ws_port` | — | Brain server port (e.g. `8443`) |
-| `--brain_ws_path` | — | WebSocket path (e.g. `/`) |
-| `--brain_ws_insecure` | false | Disable TLS cert verification (local dev only — never use in production) |
-| `--brain_ws_certfile` | — | F1: mTLS client certificate PEM file for PoP→brain connection |
-| `--brain_ws_keyfile` | — | F1: mTLS client private key PEM file for PoP→brain connection |
+| `--brain_ws_port` | `443` | Brain server port (e.g. `8443`) |
+| `--brain_ws_path` | `/` | WebSocket path |
+| `--brain_ws_insecure` | false | Disable TLS cert verification (local dev only) |
+| `--brain_ws_certfile` | — | F1: mTLS client certificate PEM |
+| `--brain_ws_keyfile` | — | F1: mTLS client private key PEM |
+
+**Secondary brain (F4 standby — optional):**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--brain2_ws_host` | — | Standby brain hostname or IP (absent = disabled) |
+| `--brain2_ws_port` | `443` | Standby brain port |
+| `--brain2_ws_path` | `/` | WebSocket path |
+| `--brain2_ws_insecure` | false | Disable TLS cert verification |
+| `--brain2_ws_certfile` | — | mTLS client certificate PEM |
+| `--brain2_ws_keyfile` | — | mTLS client private key PEM |
+
+When `brain2_ws_host` is set, PoP creates a second `WsPublishSink` and fans out every event to both brains. If either connection drops, it reconnects independently (exponential backoff) without affecting the other.
 
 ### Persistence (optional)
 
@@ -187,7 +202,7 @@ On any trigger, `restartSync()` resets to `DISCONNECTED` and schedules a reconne
 | `rest_` | `RestClient` | REST snapshot fetch |
 | `controller_` | `OrderBookController` | Book state machine |
 | `persist_` | `FilePersistSink` | JSONL.gz writer (optional) |
-| `brain_publish_` | `WsPublishSink` | Brain publisher (optional) |
+| `brain_sinks_` | `vector<WsPublishSink>` | Brain publisher(s) — 0, 1 (primary only), or 2 (primary + standby) |
 | `adapter_` | `AnyAdapter` (variant) | Venue-specific parsing |
 | `buffer_` | `deque<BufferedMsg>` | Incrementals buffered before sync, max 10 000 |
 
