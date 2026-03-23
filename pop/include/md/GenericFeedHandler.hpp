@@ -62,6 +62,18 @@ namespace md {
         /// Stop sockets/timers and reset runtime state.
         FeedOpResult stop() override;
 
+        // D5: Health endpoint observers — thread-safe; safe to call from any thread.
+        [[nodiscard]] bool is_running() const noexcept {
+            return running_.load(std::memory_order_relaxed);
+        }
+        [[nodiscard]] const char *sync_state_str() const noexcept {
+            return sync_state_to_string_(state_.load(std::memory_order_relaxed));
+        }
+        [[nodiscard]] std::uint64_t resync_count() const noexcept {
+            return ctr_resyncs_.load(std::memory_order_relaxed);
+        }
+        [[nodiscard]] const FeedHandlerConfig &config() const noexcept { return cfg_; }
+
     private:
         /// Concrete adapter selected from `FeedHandlerConfig::venue_name`.
         using AnyAdapter = std::variant<BinanceAdapter, OKXAdapter, BitgetAdapter, BybitAdapter, KucoinAdapter>;
@@ -174,14 +186,14 @@ namespace md {
 
         std::unique_ptr<OrderBookController> controller_;
         std::unique_ptr<FilePersistSink> persist_;
-        std::unique_ptr<WsPublishSink> brain_publish_;
+        std::vector<std::unique_ptr<WsPublishSink>> brain_sinks_; ///< F4: 0=no brain, 1=primary, 2=primary+standby
 
         FeedHandlerConfig cfg_; /// DO NOT READ IN HOT PATH
         RuntimeResolved rt_;
         AnyAdapter adapter_;
 
         std::atomic<bool> running_{false};
-        FeedSyncState state_{FeedSyncState::DISCONNECTED};
+        std::atomic<FeedSyncState> state_{FeedSyncState::DISCONNECTED};
 
         /// Buffered incrementals captured before a valid baseline is ready.
         struct BufferedMsg {
@@ -218,7 +230,7 @@ namespace md {
 
         // D2: per-feed counters
         std::uint64_t ctr_msgs_received_{0};   ///< raw WS frames received since last heartbeat
-        std::uint64_t ctr_resyncs_{0};         ///< total restartSync() calls
+        std::atomic<std::uint64_t> ctr_resyncs_{0}; ///< total restartSync() calls (atomic for cross-thread health reads)
         std::uint64_t ctr_book_updates_{0};    ///< total applied incremental updates
         std::uint64_t ctr_outbox_drops_{0};    ///< WsPublishSink outbox overflow drops (approximation)
 

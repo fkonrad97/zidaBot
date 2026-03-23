@@ -25,19 +25,24 @@ namespace md {
             }
             if (use_gzip_()) {
                 gz_out_ = gzopen(path_.c_str(), "ab");
+                file_open_.store(gz_out_ != nullptr, std::memory_order_relaxed);
             } else {
                 out_.open(path_, std::ios::out | std::ios::app);
+                file_open_.store(out_.is_open(), std::memory_order_relaxed);
             }
         } catch (...) {
             // Keep sink disabled if path setup/open fails.
         }
+        // G3: start writer thread (it will do nothing if file_open_ is false)
+        writer_running_.store(true, std::memory_order_relaxed);
+        writer_thread_ = std::thread(&FilePersistSink::writer_loop_, this);
     }
 
     FilePersistSink::~FilePersistSink() {
-        if (gz_out_ != nullptr) {
-            gzclose(gz_out_);
-            gz_out_ = nullptr;
-        }
+        // G3: signal writer thread to drain and exit; file handles closed inside writer_loop_.
+        writer_running_.store(false, std::memory_order_relaxed);
+        write_cv_.notify_all();
+        if (writer_thread_.joinable()) writer_thread_.join();
     }
 
     std::int64_t FilePersistSink::now_ns_() noexcept {
@@ -79,6 +84,7 @@ namespace md {
 
     void FilePersistSink::rotate_() noexcept {
         // Only rotate plain JSONL; gzip rotation is not yet supported.
+        // Called from writer_loop_ (writer thread only).
         if (gz_out_ != nullptr || !out_.is_open()) return;
         out_.flush();
         out_.close();
@@ -91,30 +97,47 @@ namespace md {
         bytes_written_ = 0;
     }
 
-    void FilePersistSink::write_line_(const nlohmann::json &j) noexcept {
-        try {
-            const std::string line = j.dump() + '\n';
+    void FilePersistSink::enqueue_line_(std::string line) noexcept {
+        // G3: called on handler I/O thread — non-blocking.
+        std::lock_guard lk(write_mu_);
+        while (write_queue_.size() >= kWriteQueueCap)
+            write_queue_.pop();          // drop oldest — prefer freshness
+        write_queue_.push(std::move(line));
+        write_cv_.notify_one();
+    }
 
-            if (gz_out_ != nullptr) {
-                const int rc = gzwrite(gz_out_, line.data(), static_cast<unsigned int>(line.size()));
-                if (rc > 0) {
-                    gzflush(gz_out_, Z_SYNC_FLUSH);
+    void FilePersistSink::writer_loop_() noexcept {
+        // G3: background writer — owns all disk I/O.
+        while (true) {
+            std::string line;
+            {
+                std::unique_lock lk(write_mu_);
+                write_cv_.wait(lk, [&] {
+                    return !write_queue_.empty()
+                        || !writer_running_.load(std::memory_order_relaxed);
+                });
+                if (write_queue_.empty()) break;   // shutdown: queue drained
+                line = std::move(write_queue_.front());
+                write_queue_.pop();
+            }
+            try {
+                if (gz_out_ != nullptr) {
+                    const int rc = gzwrite(gz_out_, line.data(),
+                                           static_cast<unsigned int>(line.size()));
+                    if (rc > 0) gzflush(gz_out_, Z_SYNC_FLUSH);
+                } else if (out_.is_open()) {
+                    out_ << line;
+                    out_.flush();
+                    bytes_written_ += static_cast<std::uint64_t>(line.size());
+                    if (max_file_bytes_ > 0 && bytes_written_ >= max_file_bytes_)
+                        rotate_();
                 }
-                return;
-            }
-
-            if (!out_.is_open()) return;
-            out_ << line;
-            out_.flush();
-            bytes_written_ += static_cast<std::uint64_t>(line.size());
-
-            // D3: rotate when size limit reached (plain JSONL only)
-            if (max_file_bytes_ > 0 && bytes_written_ >= max_file_bytes_) {
-                rotate_();
-            }
-        } catch (...) {
-            // If writes fail, keep the feed alive; persistence is best-effort for now.
+            } catch (...) {}
         }
+        // Close file handles on exit — destructor has already joined us.
+        if (gz_out_ != nullptr) { gzclose(gz_out_); gz_out_ = nullptr; }
+        if (out_.is_open())     { out_.flush(); out_.close(); }
+        file_open_.store(false, std::memory_order_relaxed);
     }
 
     void FilePersistSink::write_snapshot(const GenericSnapshotFormat &snap, std::string_view source) noexcept {
@@ -133,7 +156,7 @@ namespace md {
         j["checksum"] = snap.checksum;
         j["bids"] = levels_to_json_(snap.bids);
         j["asks"] = levels_to_json_(snap.asks);
-        write_line_(j);
+        enqueue_line_(j.dump() + '\n');
     }
 
     void FilePersistSink::write_incremental(const GenericIncrementalFormat &inc, std::string_view source) noexcept {
@@ -153,7 +176,7 @@ namespace md {
         j["checksum"] = inc.checksum;
         j["bids"] = levels_to_json_(inc.bids);
         j["asks"] = levels_to_json_(inc.asks);
-        write_line_(j);
+        enqueue_line_(j.dump() + '\n');
     }
 
     void FilePersistSink::write_book_state(const OrderBook &book,
@@ -176,6 +199,6 @@ namespace md {
         j["top_n"] = top_n;
         j["bids"] = levels_from_book_(book, top_n, Side::BID);
         j["asks"] = levels_from_book_(book, top_n, Side::ASK);
-        write_line_(j);
+        enqueue_line_(j.dump() + '\n');
     }
 }

@@ -13,8 +13,11 @@
 
 struct CmdOptions {
     std::string venue; // required
-    std::string base; // --base BTC
-    std::string quote; // --quote USDT
+    std::string base; // --base BTC  (single-symbol mode)
+    std::string quote; // --quote USDT  (single-symbol mode)
+    // F3: multi-symbol — overrides base/quote when present.
+    // Format: "BTC/USDT,ETH/USDT,SOL/USDT"
+    std::optional<std::string> symbols;
     std::optional<int> depthLevel;
     std::optional<std::string> ws_host; // override or std::nullopt
     std::optional<std::string> ws_port; // override or std::nullopt
@@ -28,6 +31,13 @@ struct CmdOptions {
     bool brain_ws_insecure{false}; // disable TLS verification (local testing)
     std::optional<std::string> brain_ws_certfile; // F1: mTLS client cert PEM
     std::optional<std::string> brain_ws_keyfile;  // F1: mTLS client key PEM
+    // F4: secondary brain connection for active-passive failover
+    std::optional<std::string> brain2_ws_host;
+    std::optional<std::string> brain2_ws_port;
+    std::optional<std::string> brain2_ws_path;
+    bool brain2_ws_insecure{false};
+    std::optional<std::string> brain2_ws_certfile;
+    std::optional<std::string> brain2_ws_keyfile;
     std::optional<std::string> persist_path; // optional JSONL persistence file
     std::optional<std::string> log_path; // optional process log file path
     int persist_book_every_updates{0}; // 0 = disabled
@@ -47,6 +57,7 @@ struct CmdOptions {
     bool debug_checksum{true};
     bool debug_seq{true};
 
+    uint16_t health_port{0}; // D5: plain-HTTP health endpoint port (0 = disabled)
     bool show_help{false};
 };
 
@@ -74,10 +85,12 @@ inline bool parse_cmdline(int argc, char **argv, CmdOptions &out) {
              "F2: config file path (key=value per line; CLI flags override file values)")
             ("venue,v", po::value<std::string>()->required(),
              "Venue name (binance, okx, bybit, bitget, kucoin)")
-            ("base", po::value<std::string>()->required(),
-             "Base asset, e.g. BTC")
-            ("quote", po::value<std::string>()->required(),
-             "Quote asset, e.g. USDT")
+            ("symbols", po::value<std::string>(),
+             "F3: comma-separated symbol pairs e.g. BTC/USDT,ETH/USDT (overrides --base/--quote)")
+            ("base", po::value<std::string>()->default_value(""),
+             "Base asset, e.g. BTC (single-symbol mode; ignored when --symbols is set)")
+            ("quote", po::value<std::string>()->default_value(""),
+             "Quote asset, e.g. USDT (single-symbol mode; ignored when --symbols is set)")
             ("depthLevel,dl", po::value<int>()->default_value(400),
              "Orderbook depth; required or defaults")
             ("ws_host", po::value<std::string>(),
@@ -104,6 +117,18 @@ inline bool parse_cmdline(int argc, char **argv, CmdOptions &out) {
              "F1: mTLS client certificate PEM file for PoP->brain connection")
             ("brain_ws_keyfile", po::value<std::string>(),
              "F1: mTLS client private key PEM file for PoP->brain connection")
+            ("brain2_ws_host", po::value<std::string>(),
+             "F4: secondary brain WS host for active-passive failover")
+            ("brain2_ws_port", po::value<std::string>(),
+             "F4: secondary brain WS port")
+            ("brain2_ws_path", po::value<std::string>(),
+             "F4: secondary brain WS path, e.g. /")
+            ("brain2_ws_insecure", po::bool_switch()->default_value(false),
+             "F4: secondary brain: disable TLS cert/host check (local testing only)")
+            ("brain2_ws_certfile", po::value<std::string>(),
+             "F4: secondary brain mTLS client cert PEM")
+            ("brain2_ws_keyfile", po::value<std::string>(),
+             "F4: secondary brain mTLS client key PEM")
             ("persist_path", po::value<std::string>(),
              "Optional persistence output file path (JSONL)")
             ("log_path", po::value<std::string>(),
@@ -135,7 +160,9 @@ inline bool parse_cmdline(int argc, char **argv, CmdOptions &out) {
             ("debug_no_checksum", po::bool_switch()->default_value(false),
              "Debug: do NOT print checksum fields")
             ("debug_no_seq", po::bool_switch()->default_value(false),
-             "Debug: do NOT print seq/prev fields");
+             "Debug: do NOT print seq/prev fields")
+            ("health_port", po::value<uint16_t>()->default_value(0),
+             "D5: plain-HTTP health endpoint port (0 = disabled); e.g. 8080");
 
     po::variables_map vm;
     try {
@@ -159,7 +186,7 @@ inline bool parse_cmdline(int argc, char **argv, CmdOptions &out) {
 
         if (vm.count("help")) {
             std::cout << "Usage: " << argv[0]
-                    << " --venue VENUE --base BTC --quote USDT "
+                    << " --venue VENUE (--symbols BTC/USDT,ETH/USDT | --base BTC --quote USDT) "
                     << "[--depthLevel N] "
                     << "[--ws_host HOST] [--ws_port PORT] [--ws_path PATH] "
                     << "[--rest_host HOST] [--rest_port PORT] [--rest_path PATH] "
@@ -183,6 +210,7 @@ inline bool parse_cmdline(int argc, char **argv, CmdOptions &out) {
     out.venue = vm["venue"].as<std::string>();
     out.base = vm["base"].as<std::string>();
     out.quote = vm["quote"].as<std::string>();
+    if (vm.count("symbols")) out.symbols = vm["symbols"].as<std::string>();
     out.depthLevel = vm["depthLevel"].as<int>();
     if (vm.count("ws_host")) out.ws_host = vm["ws_host"].as<std::string>();
     if (vm.count("ws_port")) out.ws_port = vm["ws_port"].as<std::string>();
@@ -196,6 +224,12 @@ inline bool parse_cmdline(int argc, char **argv, CmdOptions &out) {
     out.brain_ws_insecure = vm["brain_ws_insecure"].as<bool>();
     if (vm.count("brain_ws_certfile")) out.brain_ws_certfile = vm["brain_ws_certfile"].as<std::string>();
     if (vm.count("brain_ws_keyfile"))  out.brain_ws_keyfile  = vm["brain_ws_keyfile"].as<std::string>();
+    if (vm.count("brain2_ws_host"))    out.brain2_ws_host    = vm["brain2_ws_host"].as<std::string>();
+    if (vm.count("brain2_ws_port"))    out.brain2_ws_port    = vm["brain2_ws_port"].as<std::string>();
+    if (vm.count("brain2_ws_path"))    out.brain2_ws_path    = vm["brain2_ws_path"].as<std::string>();
+    out.brain2_ws_insecure = vm["brain2_ws_insecure"].as<bool>();
+    if (vm.count("brain2_ws_certfile")) out.brain2_ws_certfile = vm["brain2_ws_certfile"].as<std::string>();
+    if (vm.count("brain2_ws_keyfile"))  out.brain2_ws_keyfile  = vm["brain2_ws_keyfile"].as<std::string>();
     if (vm.count("persist_path")) out.persist_path = vm["persist_path"].as<std::string>();
     if (vm.count("log_path")) out.log_path = vm["log_path"].as<std::string>();
     out.persist_book_every_updates = std::max(0, vm["persist_book_every_updates"].as<int>());
@@ -217,6 +251,7 @@ inline bool parse_cmdline(int argc, char **argv, CmdOptions &out) {
     const bool no_seq = vm["debug_no_seq"].as<bool>();
     out.debug_checksum = !no_checksum;
     out.debug_seq = !no_seq;
+    out.health_port = vm["health_port"].as<uint16_t>();
 
     return true;
 }

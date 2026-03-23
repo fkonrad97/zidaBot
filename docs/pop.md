@@ -1,9 +1,13 @@
 # pop — Market Data Ingestion Process
 
-`pop/` is a single-venue, single-symbol market data ingestion edge process. Run one instance per venue. It connects to an exchange, maintains a live order book, and fans out normalized events to persistence and/or the brain.
+`pop/` is a single-venue market data ingestion edge process. Run one instance per venue. It connects to an exchange, maintains live order books for one or more symbols, and fans out normalized events to persistence and/or the brain.
 
-```
+```bash
+# Single symbol
 ./build/pop/pop --venue binance --base BTC --quote USDT [options]
+
+# Multi-symbol (F3) — one process tracks multiple symbols on the same venue
+./build/pop/pop --venue binance --symbols BTC/USDT,ETH/USDT,SOL/USDT [options]
 ```
 
 ---
@@ -12,13 +16,15 @@
 
 Parsed by `pop/include/CmdLine.hpp` into `CmdOptions`.
 
-### Required
+### Symbol selection (one of the following is required)
 
 | Flag | Description |
 |---|---|
-| `--venue` | Venue name: `binance`, `okx`, `bybit`, `bitget`, `kucoin` |
-| `--base` | Base asset, e.g. `BTC` |
-| `--quote` | Quote asset, e.g. `USDT` |
+| `--symbols` | F3: Comma-separated symbol pairs, e.g. `BTC/USDT,ETH/USDT`. Overrides `--base`/`--quote` when present. |
+| `--base` + `--quote` | Single-symbol mode. Used when `--symbols` is absent. |
+| `--venue` | **Always required.** Venue name: `binance`, `okx`, `bybit`, `bitget`, `kucoin` |
+
+When `--symbols` is used, each pair spawns an independent `GenericFeedHandler`, each on its own `io_context` + `std::thread` (G1 — fully isolated: a slow venue cannot stall others). Per-symbol persist paths are derived automatically when `--persist_path` is set (e.g. `/tmp/feed.jsonl` → `/tmp/feed_BTC_USDT.jsonl`, `/tmp/feed_ETH_USDT.jsonl`).
 
 ### Order book
 
@@ -37,16 +43,31 @@ All default to venue-canonical values. Override only for testing or alternate re
 
 ### Brain publishing (optional)
 
-Disabled when `--brain_ws_host` is absent.
+Disabled when `--brain_ws_host` is absent. PoP can publish to up to two brain instances simultaneously (primary + standby) for F4 active-passive failover.
+
+**Primary brain:**
 
 | Flag | Default | Description |
 |---|---|---|
 | `--brain_ws_host` | — | Brain server hostname or IP |
-| `--brain_ws_port` | — | Brain server port (e.g. `8443`) |
-| `--brain_ws_path` | — | WebSocket path (e.g. `/`) |
-| `--brain_ws_insecure` | false | Disable TLS cert verification (local dev only — never use in production) |
-| `--brain_ws_certfile` | — | F1: mTLS client certificate PEM file for PoP→brain connection |
-| `--brain_ws_keyfile` | — | F1: mTLS client private key PEM file for PoP→brain connection |
+| `--brain_ws_port` | `443` | Brain server port (e.g. `8443`) |
+| `--brain_ws_path` | `/` | WebSocket path |
+| `--brain_ws_insecure` | false | Disable TLS cert verification (local dev only) |
+| `--brain_ws_certfile` | — | F1: mTLS client certificate PEM |
+| `--brain_ws_keyfile` | — | F1: mTLS client private key PEM |
+
+**Secondary brain (F4 standby — optional):**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--brain2_ws_host` | — | Standby brain hostname or IP (absent = disabled) |
+| `--brain2_ws_port` | `443` | Standby brain port |
+| `--brain2_ws_path` | `/` | WebSocket path |
+| `--brain2_ws_insecure` | false | Disable TLS cert verification |
+| `--brain2_ws_certfile` | — | mTLS client certificate PEM |
+| `--brain2_ws_keyfile` | — | mTLS client private key PEM |
+
+When `brain2_ws_host` is set, PoP creates a second `WsPublishSink` and fans out every event to both brains. If either connection drops, it reconnects independently (exponential backoff) without affecting the other.
 
 ### Persistence (optional)
 
@@ -70,12 +91,13 @@ Disabled when `--brain_ws_host` is absent.
 |---|---|---|
 | `--rest_timeout_ms` | 8000 | REST snapshot request timeout in milliseconds (minimum 1000) |
 
-### Logging
+### Operations
 
 | Flag | Default | Description |
 |---|---|---|
 | `--log_level` | `info` | D1: Log verbosity: `debug` \| `info` \| `warn` \| `error` |
 | `--log_path` | — | D1: Write log to file in addition to stderr (`.log` appended if no extension) |
+| `--health_port` | `0` | D5: Plain-HTTP health endpoint port (0 = disabled). `GET /health` returns JSON with per-handler sync state, uptime, and resync counts. |
 
 ### Configuration file
 
@@ -180,7 +202,7 @@ On any trigger, `restartSync()` resets to `DISCONNECTED` and schedules a reconne
 | `rest_` | `RestClient` | REST snapshot fetch |
 | `controller_` | `OrderBookController` | Book state machine |
 | `persist_` | `FilePersistSink` | JSONL.gz writer (optional) |
-| `brain_publish_` | `WsPublishSink` | Brain publisher (optional) |
+| `brain_sinks_` | `vector<WsPublishSink>` | Brain publisher(s) — 0, 1 (primary only), or 2 (primary + standby) |
 | `adapter_` | `AnyAdapter` (variant) | Venue-specific parsing |
 | `buffer_` | `deque<BufferedMsg>` | Incrementals buffered before sync, max 10 000 |
 

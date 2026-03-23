@@ -17,6 +17,30 @@
 #include <string>
 
 namespace md {
+
+    // Custom error category for HTTP-level errors (non-2xx responses).
+    // Allows callers to distinguish exchange HTTP errors (4xx, 5xx) from
+    // transport/protocol failures (connection reset, TLS error, timeout).
+    enum class http_errc { non_2xx = 1 };
+
+    struct http_error_category_impl : boost::system::error_category {
+        const char *name() const noexcept override { return "http"; }
+        std::string message(int ev) const override {
+            return (ev == static_cast<int>(http_errc::non_2xx))
+                       ? "HTTP non-2xx response"
+                       : "unknown http error";
+        }
+    };
+
+    inline const boost::system::error_category &http_error_category() {
+        static http_error_category_impl inst;
+        return inst;
+    }
+
+    inline boost::system::error_code make_error_code(http_errc e) {
+        return {static_cast<int>(e), http_error_category()};
+    }
+
     class RestClient : public std::enable_shared_from_this<RestClient> {
     public:
         using ResponseHandler = std::function<void(boost::system::error_code, std::string)>;

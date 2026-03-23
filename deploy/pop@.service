@@ -1,0 +1,24 @@
+[Unit]
+Description=ZidaBot PoP — %i market data feed
+After=network.target brain.service
+Wants=network-online.target
+
+# %i is the venue name (e.g. "binance", "okx", "bybit", "bitget", "kucoin")
+# Enable with: systemctl enable pop@binance pop@okx pop@bybit pop@bitget pop@kucoin
+
+[Service]
+Type=simple
+User=zidabot
+Group=zidabot
+
+ExecStart=/usr/local/bin/pop --config /etc/zidabot/pop_%i.conf
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=10s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zidabot-pop-%i
+
+[Install]
+WantedBy=multi-user.target

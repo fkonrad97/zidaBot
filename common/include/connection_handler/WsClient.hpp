@@ -60,6 +60,9 @@ namespace md {
 
         void send_text(std::string text);
 
+        // H1: send a binary WebSocket frame (MessagePack payload).
+        void send_binary(std::string data);
+
         void close();
 
         void cancel();
@@ -125,7 +128,9 @@ namespace md {
         std::atomic_bool close_notified_{false};
         bool opened_{false};
 
-        std::deque<std::string> outbox_;
+        // H1: per-message binary flag so text and binary frames can coexist.
+        struct OutboxMsg { std::string data; bool binary{false}; };
+        std::deque<OutboxMsg> outbox_;
         std::size_t max_outbox_{10'000};
         bool write_in_flight_{false};
 

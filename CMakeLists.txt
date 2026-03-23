@@ -30,7 +30,9 @@ if(NOT MSVC)
         -fPIE
         $<$<NOT:$<CONFIG:Debug>>:-D_FORTIFY_SOURCE=2>
     )
-    add_link_options(-pie -Wl,-z,relro,-z,now)
+    if(NOT APPLE)
+        add_link_options(-pie -Wl,-z,relro,-z,now)
+    endif()
 endif()
 
 # ---- Sanitizer options (off by default; enable for dev/CI) ----
@@ -93,6 +95,13 @@ FetchContent_MakeAvailable(spdlog)
 add_subdirectory(common)
 add_subdirectory(pop)
 add_subdirectory(brain)
+
+# ---- Tests ----
+option(BUILD_TESTS "Build unit tests" ON)
+if(BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
 
 message(STATUS "Project: ${PROJECT_NAME} v${PROJECT_VERSION}")
 message(STATUS "C++ Standard: ${CMAKE_CXX_STANDARD}")

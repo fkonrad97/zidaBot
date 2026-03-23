@@ -62,6 +62,15 @@ namespace md {
         std::string brain_ws_certfile;
         std::string brain_ws_keyfile;
 
+        // F4: secondary brain connection for active-passive failover.
+        // Empty brain2_ws_host = disabled (single-brain mode).
+        std::string brain2_ws_host;
+        std::string brain2_ws_port;
+        std::string brain2_ws_path;
+        bool brain2_ws_insecure{false};
+        std::string brain2_ws_certfile;
+        std::string brain2_ws_keyfile;
+
         std::string persist_path; ///< optional event persistence file path, "" = disabled
         std::size_t persist_book_every_updates{0}; ///< 0 = disabled
         std::size_t persist_book_top{0}; ///< top N levels per side for book_state

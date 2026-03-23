@@ -69,8 +69,8 @@ Needed to run the engine unattended and debug incidents.
 | D2 | Per-venue counters: messages received, resyncs triggered, outbox drops, crosses detected — exposed via stderr heartbeat | HIGH | ✅ Done | `pop/src/md/GenericFeedHandler.cpp`, `brain/src/brain/ArbDetector.cpp` | PoP: `[HEARTBEAT]` every 60 s with msgs/book_updates/resyncs; Brain: total crosses on `flush()` |
 | D3 | Output file rotation: size- or time-based rotation for `--output` arb JSONL and `--persist_path` files; prevents unbounded disk growth | MEDIUM | ✅ Done | `brain/src/brain/ArbDetector.cpp`, `brain/include/brain/BrainCmdLine.hpp`, `pop/src/postprocess/FilePersistSink.cpp`, `pop/include/postprocess/FilePersistSink.hpp` | `--output-max-mb N` for arb JSONL; persist sink rotates plain JSONL; .gz rotation deferred |
 | D4 | Brain watchdog: periodic timer (e.g. 60 s) that logs WARN if `synced_count() == 0` or no arb scan has fired for N seconds | MEDIUM | ✅ Done | `brain/app/brain.cpp`, `brain/include/brain/BrainCmdLine.hpp`, `brain/include/brain/ArbDetector.hpp` | `--watchdog-no-cross-sec N` (0=off); always warns when synced_count==0 |
-| D5 | Health endpoint: Unix-socket or HTTP endpoint queryable for current feed status without grepping stderr | LOW | ⬜ Not Started | brain, pop | |
-| D6 | Process supervisor config: systemd unit files (or supervisord configs) for auto-restart on crash | LOW | ⬜ Not Started | `deploy/` (new directory) | |
+| D5 | Health endpoint: Unix-socket or HTTP endpoint queryable for current feed status without grepping stderr | LOW | ✅ Done | `common/include/utils/HealthServer.hpp`, `brain/app/brain.cpp`, `pop/app/main.cpp`, `brain/include/brain/BrainCmdLine.hpp`, `pop/include/CmdLine.hpp`, `pop/include/md/GenericFeedHandler.hpp`, `brain/include/brain/WsServer.hpp` | `--health-port N` (brain) / `--health_port N` (pop); plain HTTP JSON; 0=disabled; `ok:true` when all synced |
+| D6 | Process supervisor config: systemd unit files (or supervisord configs) for auto-restart on crash | LOW | ✅ Done | `deploy/brain.service`, `deploy/pop@.service`, `deploy/supervisord.conf`, `deploy/README.md` | systemd template unit `pop@.service` (one per venue); supervisord alternative; pop now handles SIGTERM gracefully |
 
 ---
 
@@ -96,10 +96,185 @@ Larger architectural changes for running at scale or in a high-availability setu
 |---|---|---|---|---|
 | F1 | Mutual TLS (mTLS) between PoP and Brain: PoP presents client cert signed by private CA; brain verifies it | HIGH | ✅ Done | `common/include/connection_handler/WsClient.hpp`, `common/src/connection_handler/WsClient.cpp`, `pop/include/postprocess/WsPublishSink.hpp`, `pop/src/postprocess/WsPublishSink.cpp`, `pop/include/abstract/FeedHandler.hpp`, `pop/include/CmdLine.hpp`, `pop/app/main.cpp`, `pop/src/md/GenericFeedHandler.cpp`, `brain/include/brain/BrainCmdLine.hpp`, `brain/app/brain.cpp` | `--brain_ws_certfile/keyfile` on PoP; `--ca-certfile` on brain; opt-in, backward-compatible |
 | F2 | Configuration file support (YAML/TOML) with CLI overrides; eliminates long command lines for multi-venue deployments | MEDIUM | ✅ Done | `pop/include/CmdLine.hpp`, `brain/include/brain/BrainCmdLine.hpp` | `--config FILE` (key=value format, boost `parse_config_file`); no new deps; CLI overrides file |
-| F3 | Multi-symbol support: one PoP process can track multiple symbols; `FeedHandlerConfig` becomes a symbol list | MEDIUM | ⬜ Not Started | `pop/app/main.cpp`, `pop/src/md/GenericFeedHandler.cpp` |
-| F4 | Brain active-passive failover: secondary brain subscribes to same PoPs, promotes on primary failure | LOW | ⬜ Not Started | new component |
-| F5 | Latency pipeline: histogram (p50/p95/p99) of PoP-receive → brain-detected latency per venue pair | LOW | ⬜ Not Started | `brain/src/brain/ArbDetector.cpp` |
+| F3 | Multi-symbol support: one PoP process can track multiple symbols; `FeedHandlerConfig` becomes a symbol list | MEDIUM | ✅ Done | `pop/include/CmdLine.hpp`, `pop/app/main.cpp` | `--symbols BTC/USDT,ETH/USDT`; N handlers share one `io_context`; per-symbol persist path derivation; fully backward-compatible with `--base`/`--quote` |
+| F4 | Brain active-passive failover: secondary brain subscribes to same PoPs, promotes on primary failure | LOW | ✅ Done | `--standby` flag + SIGUSR1 promotion; PoP fan-out via `brain2_ws_*`; health shows `standby: true/false` |
+| F5 | Latency pipeline: histogram (p50/p95/p99) of PoP-receive → brain-detected latency per venue pair | LOW | ✅ Done | `LatencyHistogram` circular buffer; `lag_ns` in JSONL; `latency_us` in health JSON; logged on flush |
 | F6 | Reconnect jitter: ±25% random jitter on all reconnect delays to prevent thundering herd on simultaneous restarts | LOW | ✅ Done | `pop/src/postprocess/WsPublishSink.cpp` | WsPublishSink now uses `mt19937` ±25% jitter matching GenericFeedHandler |
+
+---
+
+## Track G — Concurrency & Scaling
+
+Scaling paths for when symbol count grows or per-message CPU cost increases.
+Current single-threaded `io_context` is correct and sufficient for 2–10 symbols (I/O-bound workload).
+
+| # | Item | Priority | Status | Notes |
+|---|---|---|---|---|
+| G1 | Per-handler thread isolation: one `io_context` + one thread per `GenericFeedHandler`; eliminates single-thread bottleneck for 20+ symbols without strand refactoring | MEDIUM | ✅ Done | `main_ioc` for health/signals; per-handler ioc+thread; work guards; `state_`/`ctr_resyncs_` made atomic for cross-thread health reads |
+| G2 | Brain I/O thread pool: call `ioc.run()` from N threads (min 2, max 4, capped at `hardware_concurrency`) to allow concurrent TLS handshakes and reads across all PoP sessions | LOW | ✅ Done | `brain/app/brain.cpp` | Safe: WsServer sessions already use strands; signal handler calls `ioc.stop()` — all threads exit cleanly |
+| G3 | Async `FilePersistSink`: move disk writes (gzwrite+flush, ofstream+flush, rotation) off the handler I/O thread onto a bounded internal writer thread (queue cap 10k, drop-oldest) | LOW | ✅ Done | `pop/include/postprocess/FilePersistSink.hpp`, `pop/src/postprocess/FilePersistSink.cpp` | Handler thread enqueues pre-serialised `j.dump()` string and returns immediately; writer thread owns all file handles; destructor signals + joins before process exits |
+| G4 | Brain multithreaded architecture: brain runs `ioc.run()` on one thread; arb scan and JSON parsing compete with I/O callbacks. Options: dedicated scan thread fed by lock-free queue; or strand-per-session (WsServer already uses strands) + separate scan thread owning `UnifiedBook`+`ArbDetector` | MEDIUM | ✅ Done | Dedicated scan thread owns `book`+`arb`; I/O thread deserializes + enqueues (mutex+condvar, 50k cap); `HealthSnapshot` replaces direct cross-thread reads; clean join on shutdown |
+
+---
+
+## Track H — Wire Format & Protocol
+
+Performance improvements to the PoP→brain event wire format. Currently all events are
+serialised as JSON text frames, which is human-readable but CPU-heavy on both ends.
+
+| # | Item | Priority | Status | Notes |
+|---|---|---|---|---|
+| H1 | Binary wire format between PoP and Brain: replace `nlohmann::json` serialisation/deserialisation with MessagePack (drop-in, same schema), FlatBuffers (zero-copy, requires schema), or a custom fixed binary layout. Biggest win is on the brain parse side (hot path, single thread). | MEDIUM | ✅ Done | `nlohmann::json::to_msgpack()` / `from_msgpack()` — zero new deps; WS binary frames; backward-compat text-JSON fallback in brain; `send_binary()` added to `WsClient` |
+
+---
+
+## Track I — Python Backtest Environment
+
+Expose the C++ arb detection engine to Python via pybind11 for replaying historical
+JSONL data and strategy research. Full design in `docs/backtest.md`.
+
+| # | Item | Priority | Status | Notes |
+|---|---|---|---|---|
+| I1 | `BacktestEngine` C++ class: thin synchronous wrapper around `UnifiedBook` + `ArbDetector`; no threads, no TLS, no file I/O; `feed_event(json_line) → vector<ArbCross>` | HIGH | ⬜ Not Started | `ArbDetector::scan()` already returns `vector<ArbCross>`; production brain ignores it — no existing code changes needed |
+| I2 | pybind11 binding module (`python/zidabot.cpp`): expose `BacktestEngine`, `ArbCross`, `BBO`; `pybind11/stl.h` for automatic `vector<ArbCross>` → `list[ArbCross]` | HIGH | ⬜ Not Started | FetchContent pybind11 v2.13.1; `pybind11_add_module(zidabot ...)`; build with `--target zidabot` |
+| I3 | `python/example_backtest.py`: minimal working replay script (JSONL/.gz → pandas DataFrame); ships as usage reference | MEDIUM | ⬜ Not Started | Depends on I1 + I2 |
+| I4 | Depth curve access: expose full bid/ask level arrays per venue per event for feature engineering (spread series, book imbalance, etc.) | LOW | ⬜ Not Started | Requires binding `OrderBook::bid_ptr(i)` / `ask_ptr(i)`; defer until basic API is proven |
+
+---
+
+## Batch 11 — ✅ Complete (2026-03-23)
+
+G2 brain I/O thread pool + G3 async `FilePersistSink`.
+
+### Why these two were paired
+
+After G1 (each PoP handler on its own thread) and G4 (brain scan thread), the two remaining
+single-threaded bottlenecks were:
+- Brain's `ioc.run()` called from one thread — all WS sessions (one per PoP) serialised
+- `FilePersistSink::write_line_()` blocking the handler's I/O thread on every `gzflush`/`ofstream::flush`
+
+Both were LOW-priority improvements but required minimal blast radius (3 files total, no
+interface changes) so they were batched together.
+
+### G2 — Brain I/O thread pool (`brain/app/brain.cpp`)
+
+**Problem:** Brain ran one thread calling `ioc.run()`. With 2+ PoPs connected, each session's
+TLS handshake, async read, and `on_message` callback all serialised on that single thread.
+Head-of-line blocking: a slow TLS handshake from one PoP delayed reads from all others.
+
+**Solution:** Replace `ioc.run()` with a pool of `N = min(max(2, hw_concurrency), 4)` threads,
+all calling `ioc.run()` on the same `io_context`. This is safe because:
+- `WsServer` creates each session's socket with `net::make_strand(ioc_)` — all reads/writes
+  for a given session are strand-serialised, so no data race within a session
+- `HealthServer`, `watchdog_timer`, and `signal_set` handlers are dispatched through Asio's
+  implicit strand — safe for concurrent `ioc.run()` callers
+- The `on_message` lambda pushes to `event_queue` under `event_mu` — already mutex-guarded since G4
+- Shutdown: signal handler calls `ioc.stop()` — all N threads unblock from `run()` simultaneously
+
+**Change:** 8 lines in `brain/app/brain.cpp` (replaces one `ioc.run()` call).
+Logs `[brain] I/O thread pool: N threads` at startup.
+
+### G3 — Async `FilePersistSink` (`pop/include/postprocess/FilePersistSink.hpp`, `pop/src/postprocess/FilePersistSink.cpp`)
+
+**Problem:** `FilePersistSink::write_line_()` was called synchronously from `write_snapshot()`,
+`write_incremental()`, and `write_book_state()` — all on the handler's I/O thread (the same thread
+that reads from the exchange WebSocket). It performed `j.dump()` (CPU), then `gzwrite()` +
+`gzflush(Z_SYNC_FLUSH)` (blocks until kernel flushes compressed bytes to disk) or
+`ofstream::flush()`. On a disk stall, IO congestion, or rotation (`std::rename`), the handler
+thread was blocked and could not read the next WebSocket message — causing kernel TCP receive
+buffer buildup and potential exchange-side disconnection.
+
+`WsPublishSink` (the brain-bound sink) already used a non-blocking outbox queue; `FilePersistSink`
+was the only remaining sink that blocked the hot path.
+
+**Solution:** Added an internal writer thread to `FilePersistSink`:
+- `enqueue_line_(std::string)` — called on handler thread; locks, pushes to `std::queue<std::string>`,
+  notifies, returns immediately. Cap: 10,000 entries; drops oldest on overflow (freshness policy).
+- `writer_loop_()` — background thread; waits on condvar, pops, does `gzwrite+gzflush` or
+  `ofstream<<+flush`; also owns file rotation (`rotate_()`) and file handle close on exit.
+- JSON serialisation (`j.dump()`) stays on the handler thread — it's CPU-only and fast;
+  only disk I/O moves to the background.
+- `is_open()` now reads `std::atomic<bool> file_open_` — safe to call from the handler thread
+  while the writer thread owns the file handles.
+- Destructor: `writer_running_=false` + `notify_all` + `join` — queue is fully drained before
+  the process exits, so no data is lost on clean shutdown.
+- `persist_seq_` is incremented on the calling thread before enqueue — sequence order preserved.
+
+**Change:** 60 lines added across `.hpp` and `.cpp`; 3 call sites (`write_snapshot`,
+`write_incremental`, `write_book_state`) updated from `write_line_(j)` to `enqueue_line_(j.dump() + '\n')`.
+
+| # | Item | Status |
+|---|---|---|
+| G2 | Brain `ioc.run()` replaced with `N`-thread pool; startup log added | ✅ Done |
+| G3 | `FilePersistSink` write queue + background writer thread; `is_open()` atomicised | ✅ Done |
+
+---
+
+## Batch 10 — ⬜ Planned
+
+Python backtest environment (Track I, items I1 + I2 + I3).
+
+| # | Item | Status |
+|---|---|---|
+| I1 | `brain/include/brain/BacktestEngine.hpp` + `brain/src/brain/BacktestEngine.cpp` | ⬜ |
+| I2 | `python/zidabot.cpp` pybind11 module + `python/CMakeLists.txt` + FetchContent pybind11 | ⬜ |
+| I3 | `python/example_backtest.py` replay script | ⬜ |
+| — | Add `add_subdirectory(python)` to root `CMakeLists.txt` | ⬜ |
+
+---
+
+## Batch 10 — ✅ Complete (2026-03-23)
+
+G4 brain dedicated scan thread.
+
+| # | Item | Status |
+|---|---|---|
+| G4 | Event queue (`std::deque<nlohmann::json>`, mutex+condvar, 50k cap) between I/O thread and scan thread | ✅ Done |
+| G4 | Scan thread owns `UnifiedBook` + `ArbDetector`; calls `on_event()` + `scan()` without blocking I/O | ✅ Done |
+| G4 | `HealthSnapshot` struct updated by scan thread (under `health_mu`); health + watchdog callbacks read snapshot — no direct cross-thread access to `book`/`arb` | ✅ Done |
+| G4 | Shutdown: `scan_running=false` + `notify_all` → scan thread exits loop → `join` before `arb.flush()` | ✅ Done |
+
+---
+
+## Batch 9 — ✅ Complete (2026-03-22)
+
+G1 per-handler thread isolation + H1 MessagePack wire format.
+
+| # | Item | Status |
+|---|---|---|
+| G1 | `state_` → `std::atomic<FeedSyncState>`; `ctr_resyncs_` → `std::atomic<uint64_t>` — safe cross-thread health reads | ✅ Done |
+| G1 | `main_ioc` (health + signals) + per-handler `io_context` + `std::thread`; work guards; signal posts stop then releases guard | ✅ Done |
+| H1 | `send_binary()` added to `WsClient`; outbox tagged with `{data, bool binary}`; `ws_.text()` set per frame in `do_write_()` | ✅ Done |
+| H1 | `WsPublishSink::send_json_()` → `nlohmann::json::to_msgpack()` + `send_binary()` | ✅ Done |
+| H1 | `WsServer::MessageHandler` → `void(string_view, bool is_binary)`; `WsSession` handles both text+binary frames | ✅ Done |
+| H1 | `brain::on_message` branches on `is_binary`: `from_msgpack()` for binary, `parse()` for text (backward-compat window) | ✅ Done |
+
+---
+
+## Batch 8 — ✅ Complete (2026-03-22)
+
+F4 active-passive brain failover + F5 latency histogram.
+
+| # | Item | Status |
+|---|---|---|
+| F4 | `--standby` flag on brain: receives data, builds state, emits nothing until `kill -USR1 <pid>` | ✅ Done |
+| F4 | PoP `brain2_ws_*` config block: fan-out to primary + standby brain simultaneously | ✅ Done |
+| F4 | SIGUSR1 handler in brain promotes standby → active atomically (no restart needed) | ✅ Done |
+| F5 | `LatencyHistogram`: 10 000-sample circular buffer; p50/p95/p99 via sort on flush/query | ✅ Done |
+| F5 | `lag_ns = ts_detected_ns − max(sell_ts_book_ns, buy_ts_book_ns)` recorded per cross | ✅ Done |
+| F5 | `latency_us` added to brain health JSON; `lag_ns` added to arb JSONL; logged on `flush()` | ✅ Done |
+
+---
+
+## Batch 7 — ✅ Complete (2026-03-21)
+
+D5 health endpoint + D6 process supervisor configs. Pop SIGTERM handling added as prerequisite.
+
+| # | Item | Status |
+|---|---|---|
+| — | Pop: add SIGTERM/SIGINT handler (`boost::asio::signal_set`) — prerequisite for systemd `stop` | ✅ Done |
+| D5 | `HealthServer` header-only HTTP health class; `--health-port` / `--health_port` on both processes; JSON with sync state, uptime, per-venue/handler details | ✅ Done |
+| D6 | `deploy/brain.service`, `deploy/pop@.service` (systemd template), `deploy/supervisord.conf`, `deploy/README.md` | ✅ Done |
 
 ---
 
@@ -109,6 +284,34 @@ Larger architectural changes for running at scale or in a high-availability setu
 - When complete: change `🔄 In Progress` → `✅ Done`
 - Add new items as they are identified, in the appropriate track
 - Do not delete completed rows — they serve as a change history
+
+---
+
+## Batch 6 — ✅ Complete (2026-03-21)
+
+WsClient/RestClient bug fixes (4 bugs) + F3 multi-symbol PoP support.
+
+| # | Item | Status |
+|---|---|---|
+| Bug 1 | WsClient: missing `closing_` guard in `do_ws_handshake_()` callback (race: could set `opened_=true` on a connection that should tear down) | ✅ Done |
+| Bug 2 | WsClient: duplicate state reset in `connect()` — `opened_=false` and `close_notified_.store(false)` were set twice | ✅ Done |
+| Bug 3 | WsClient: `set_client_cert()` raw OpenSSL calls (`SSL_use_certificate_chain_file`, `SSL_use_PrivateKey_file`) had no return-value check; bad cert/key silently ignored | ✅ Done |
+| Bug 4 | RestClient: HTTP non-2xx responses used `errc::protocol_error` (EPROTO); replaced with custom `http_errc::non_2xx` category | ✅ Done |
+| F3 | Multi-symbol: `--symbols BTC/USDT,ETH/USDT`; N `GenericFeedHandler`s share one `io_context`; per-symbol persist path derivation; backward-compatible | ✅ Done |
+
+---
+
+## Batch 5 — ✅ Complete (2026-03-21)
+
+First full end-to-end run on macOS + Boost 1.88. Three platform-compatibility fixes and one latent mTLS bug fixed. No new features; no TODO items changed status.
+
+| # | Item | Status |
+|---|---|---|
+| — | `ssl::rfc2818_verification` → `ssl::host_name_verification` (removed in Boost 1.88) | ✅ Done |
+| — | CMakeLists: guard RELRO/PIE linker flags with `if(NOT APPLE)` | ✅ Done |
+| — | `timer.cancel(ignored)` → `timer.cancel()` (overload removed in Boost 1.88) | ✅ Done |
+| — | mTLS client cert bug: `set_client_cert()` now sets cert on both `ssl_ctx_` and the stream's native SSL handle | ✅ Done |
+| — | All 5 PoP configs: `brain_ws_insecure=true` for local dev (CA not in system trust store) | ✅ Done |
 
 ---
 

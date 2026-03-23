@@ -16,6 +16,8 @@ End-to-end guide covering prerequisites, build, TLS/mTLS setup, config files, an
 8. [Monitoring Output](#8-monitoring-output)
 9. [Common Flags Reference](#9-common-flags-reference)
 10. [Troubleshooting](#10-troubleshooting)
+11. [Health Endpoint](#11-health-endpoint)
+12. [Production Deployment (systemd / supervisord)](#12-production-deployment-systemd--supervisord)
 
 ---
 
@@ -239,6 +241,8 @@ Brain must be started **before** PoP instances connect.
 | `--output-max-mb` | 0 | Rotate `--output` at this file size in MB (0 = no rotation) |
 | `--watchdog-no-cross-sec` | 0 | Warn if no cross emitted for N seconds while ≥ 2 venues synced (0 = off) |
 | `--log-level` | info | Log verbosity: `debug` \| `info` \| `warn` \| `error` |
+| `--health-port` | 0 | D5: Plain-HTTP health endpoint port (0 = disabled). `GET /health` returns JSON. |
+| `--standby` | false | F4: Passive standby mode — receives data, emits no signals. Promote with `kill -USR1 <pid>`. |
 | `--config` | (none) | Config file path (key=value per line; CLI flags override file values) |
 
 Brain prints detected arb crosses to **stderr** and optionally to the `--output` JSONL file. PoP connections/disconnections are also logged to stderr.
@@ -247,16 +251,22 @@ Brain prints detected arb crosses to **stderr** and optionally to the `--output`
 
 ## 6. Running PoP
 
-One PoP process per venue. Requires `--venue`, `--base`, and `--quote`.
+One PoP process per venue. Requires `--venue` and either `--symbols` or `--base`+`--quote`.
 
 **With config file (recommended):**
 ```bash
 ./build/pop/pop --config config/binance.conf
 ```
 
-**Minimal (no persistence, no brain):**
+**Minimal single-symbol (no persistence, no brain):**
 ```bash
 ./build/pop/pop --venue binance --base BTC --quote USDT --debug
+```
+
+**Multi-symbol on one venue:**
+```bash
+./build/pop/pop --venue binance --symbols BTC/USDT,ETH/USDT,SOL/USDT \
+  --brain_ws_host 127.0.0.1 --brain_ws_port 8443 --brain_ws_path /
 ```
 
 **With brain + mTLS:**
@@ -288,8 +298,9 @@ One PoP process per venue. Requires `--venue`, `--base`, and `--quote`.
 | Flag | Default | Description |
 |---|---|---|
 | `--venue` | required | Exchange name |
-| `--base` | required | Base asset (e.g. `BTC`) |
-| `--quote` | required | Quote asset (e.g. `USDT`) |
+| `--symbols` | (none) | F3: Comma-separated symbol pairs, e.g. `BTC/USDT,ETH/USDT`. Overrides `--base`/`--quote`. |
+| `--base` | (none) | Base asset for single-symbol mode (e.g. `BTC`). Required if `--symbols` is absent. |
+| `--quote` | (none) | Quote asset for single-symbol mode (e.g. `USDT`). Required if `--symbols` is absent. |
 | `--depthLevel` | 400 | Local order book depth (Bybit caps to nearest of 1/50/200 automatically) |
 | `--brain_ws_host` | (none) | Brain hostname — enables publishing |
 | `--brain_ws_port` | (none) | Brain port |
@@ -297,6 +308,11 @@ One PoP process per venue. Requires `--venue`, `--base`, and `--quote`.
 | `--brain_ws_insecure` | false | Skip TLS cert check — dev only, never use in production |
 | `--brain_ws_certfile` | (none) | mTLS client cert PEM for PoP→brain connection |
 | `--brain_ws_keyfile` | (none) | mTLS client key PEM for PoP→brain connection |
+| `--brain2_ws_host` | (none) | F4: Standby brain hostname — enables fan-out to primary + standby simultaneously |
+| `--brain2_ws_port` | 443 | F4: Standby brain port |
+| `--brain2_ws_path` | / | F4: Standby brain WS path |
+| `--brain2_ws_certfile` | (none) | F4: Standby brain mTLS client cert PEM |
+| `--brain2_ws_keyfile` | (none) | F4: Standby brain mTLS client key PEM |
 | `--persist_path` | (none) | JSONL output file (`.gz` = compressed) |
 | `--persist_book_every_updates` | 0 | `book_state` checkpoint frequency (0 = off) |
 | `--persist_book_top` | 50 | Levels per side in `book_state` |
@@ -306,6 +322,7 @@ One PoP process per venue. Requires `--venue`, `--base`, and `--quote`.
 | `--require_checksum` | false | Resync if checksum absent on a checksum-capable venue (OKX only currently active) |
 | `--log_level` | info | Log verbosity: `debug` \| `info` \| `warn` \| `error` |
 | `--log_path` | (none) | Write log to file in addition to stderr |
+| `--health_port` | 0 | D5: Plain-HTTP health endpoint port (0 = disabled). `GET /health` returns JSON. |
 | `--config` | (none) | Config file path (key=value per line; CLI flags override file values) |
 | `--debug` | false | Rate-limited book/seq debug output |
 
@@ -393,6 +410,15 @@ tail -f /tmp/arb.jsonl
 **PoP debug output** (with `--log_level debug`) prints per-update sequence traces:
 ```
 [binance] SYNCED seq=12345678 bid=105234.00 ask=105235.50 ...
+```
+
+**Health endpoint** (when `--health_port` / `--health-port` is set):
+```bash
+# Brain
+curl -s localhost:8081/health | python3 -m json.tool
+
+# PoP
+curl -s localhost:8080/health | python3 -m json.tool
 ```
 
 ---
@@ -517,3 +543,130 @@ cmake --build build -j4
 - Bitget's WS snapshot is prepared at subscribe-time; by the time the handler processes it, the live stream has typically advanced by hundreds of updates. This is expected — `allow_seq_gap=true` is set for Bitget and handles this.
 - CRC-32 checksum validation is intentionally disabled for Bitget because the unverified baseline makes incremental checksums unreliable. Structural integrity is maintained by the crossed-book guard (C1) and periodic validate (C3).
 - If you see a resync loop, check whether the `BitgetAdapter::caps()` still has `has_checksum=false` and `allow_seq_gap=true`.
+
+---
+
+## 11. Health Endpoint
+
+Both brain and PoP expose a plain-HTTP health endpoint when started with `--health-port` / `--health_port`. Bind to `127.0.0.1` (localhost) — no TLS needed for local monitoring.
+
+### Brain
+
+```bash
+./build/brain/brain --config config/brain.conf --health-port 8081
+curl -s localhost:8081/health | python3 -m json.tool
+```
+
+```json
+{
+  "ok": true,
+  "process": "brain",
+  "uptime_s": 42,
+  "synced": 3,
+  "total": 5,
+  "standby": false,
+  "venues": [
+    {"venue": "binance", "symbol": "BTCUSDT", "state": "synced",
+     "feed_healthy": true, "age_ms": 150},
+    {"venue": "okx",     "symbol": "BTCUSDT", "state": "synced",
+     "feed_healthy": true, "age_ms": 80}
+  ],
+  "last_cross_s_ago": 12.4,
+  "ws_clients": 2,
+  "latency_us": {"p50": 920, "p95": 4200, "p99": 8800, "n": 1432}
+}
+```
+
+- `ok: true` when `synced == total`; `ok: false` when `synced == 0`
+- `age_ms` = milliseconds since last book update from that venue
+- `last_cross_s_ago` = seconds since last arb cross was emitted (null = none yet)
+- `ws_clients` = number of active PoP connections
+- `standby: true` = brain is in passive standby mode (F4); promote with `kill -USR1 <pid>`
+- `latency_us` = F5: detection latency percentiles in µs (null when no crosses yet)
+
+### PoP
+
+```bash
+./build/pop/pop --config config/binance.conf --health_port 8080
+curl -s localhost:8080/health | python3 -m json.tool
+```
+
+```json
+{
+  "ok": true,
+  "process": "pop",
+  "venue": "binance",
+  "uptime_s": 38,
+  "handlers": [
+    {"base": "BTC", "quote": "USDT", "state": "SYNCED", "running": true, "resyncs": 0},
+    {"base": "ETH", "quote": "USDT", "state": "SYNCED", "running": true, "resyncs": 1}
+  ]
+}
+```
+
+- `ok: true` when all handlers report `SYNCED`
+- `resyncs` counts total resyncs since process start (never resets)
+
+### Monitoring loop
+
+```bash
+# Watch health every 5 seconds
+watch -n 5 'curl -s localhost:8081/health | python3 -m json.tool'
+```
+
+---
+
+## 12. Production Deployment (systemd / supervisord)
+
+The `deploy/` directory contains ready-to-use process supervisor configurations. See `deploy/README.md` for full setup instructions. A summary is below.
+
+### systemd (Linux)
+
+Install binaries and config files:
+```bash
+sudo cp build/brain/brain build/pop/pop /usr/local/bin/
+sudo mkdir -p /etc/zidabot
+sudo cp config/brain.conf /etc/zidabot/
+sudo cp config/binance.conf /etc/zidabot/pop_binance.conf
+sudo cp config/okx.conf    /etc/zidabot/pop_okx.conf
+# ... repeat for bybit, bitget, kucoin
+```
+
+Install and start units:
+```bash
+sudo cp deploy/brain.service   /etc/systemd/system/
+sudo cp deploy/pop@.service    /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now brain
+sudo systemctl enable --now pop@binance pop@okx pop@bybit pop@bitget pop@kucoin
+```
+
+Check status:
+```bash
+sudo systemctl status brain
+sudo journalctl -fu pop@binance
+```
+
+### supervisord (macOS / Docker)
+
+```bash
+# Install supervisor
+pip install supervisor   # or: brew install supervisor
+
+# Copy config
+cp deploy/supervisord.conf /etc/supervisord.conf   # or ~/supervisord.conf
+
+# Start
+supervisord -c /etc/supervisord.conf
+supervisorctl status
+supervisorctl restart pops:*   # restart all PoP instances
+```
+
+### Signal handling
+
+Both processes handle `SIGINT` and `SIGTERM` gracefully:
+- Flush and close the output file (brain) / persist file (pop)
+- Close WebSocket connections cleanly
+- Exit with code 0
+
+systemd sends `SIGTERM` on `systemctl stop`, waits up to `TimeoutStopSec=10s`, then sends `SIGKILL` if needed.

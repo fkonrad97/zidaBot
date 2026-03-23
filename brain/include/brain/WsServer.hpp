@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <functional>
 #include <memory>
 #include <string>
@@ -22,7 +23,8 @@ class WsSession;
 /// WsPublishSink clients and invokes on_message for each received text frame.
 class WsServer {
 public:
-    using MessageHandler = std::function<void(std::string_view)>;
+    // H1: second argument is true when the frame is a binary (MessagePack) frame.
+    using MessageHandler = std::function<void(std::string_view, bool is_binary)>;
 
     WsServer(boost::asio::io_context &ioc,
              boost::asio::ssl::context &ssl_ctx,
@@ -34,6 +36,13 @@ public:
 
     /// Stop accepting and close all active sessions.
     void stop();
+
+    /// Count of currently live (non-expired) sessions.
+    [[nodiscard]] std::size_t session_count() const noexcept {
+        return static_cast<std::size_t>(
+            std::count_if(sessions_.begin(), sessions_.end(),
+                          [](const std::weak_ptr<WsSession> &w) { return !w.expired(); }));
+    }
 
 private:
     void do_accept_();

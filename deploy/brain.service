@@ -1,0 +1,24 @@
+[Unit]
+Description=ZidaBot Brain — arb detector / signal emitter
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zidabot
+Group=zidabot
+
+ExecStart=/usr/local/bin/brain --config /etc/zidabot/brain.conf
+Restart=on-failure
+RestartSec=5s
+
+# Give the process 10 s to handle SIGTERM before SIGKILL
+TimeoutStopSec=10s
+
+# Log to systemd journal (view with: journalctl -u brain -f)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zidabot-brain
+
+[Install]
+WantedBy=multi-user.target

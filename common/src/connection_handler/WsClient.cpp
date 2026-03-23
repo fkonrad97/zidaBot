@@ -6,7 +6,7 @@
 #include <boost/beast/version.hpp>
 #include <boost/asio/ssl/error.hpp>
 
-#include <boost/asio/ssl/rfc2818_verification.hpp>
+#include <boost/asio/ssl/host_name_verification.hpp>
 #include <openssl/ssl.h>
 
 namespace md {
@@ -58,8 +58,26 @@ namespace md {
     void WsClient::set_on_open(OpenHandler h) { on_open_ = std::move(h); }
 
     void WsClient::set_client_cert(const std::string &certfile, const std::string &keyfile) {
+        // Set on the context (affects future SSL objects created from it).
+        // Both wrappers throw boost::system::system_error on failure.
         ssl_ctx_.use_certificate_chain_file(certfile);
         ssl_ctx_.use_private_key_file(keyfile, ssl::context::pem);
+
+        // Also apply directly to the stream's SSL object: SSL_new() copies the context's
+        // cert structure at construction time, so later context changes are NOT inherited.
+        // These are raw OpenSSL C functions that return 0 on failure — check explicitly.
+        if (SSL_use_certificate_chain_file(ws_.next_layer().native_handle(), certfile.c_str()) != 1) {
+            throw boost::system::system_error{
+                boost::system::error_code{static_cast<int>(::ERR_get_error()),
+                                          boost::asio::error::get_ssl_category()},
+                "SSL_use_certificate_chain_file"};
+        }
+        if (SSL_use_PrivateKey_file(ws_.next_layer().native_handle(), keyfile.c_str(), SSL_FILETYPE_PEM) != 1) {
+            throw boost::system::system_error{
+                boost::system::error_code{static_cast<int>(::ERR_get_error()),
+                                          boost::asio::error::get_ssl_category()},
+                "SSL_use_PrivateKey_file"};
+        }
     }
 
     void WsClient::connect(std::string host, std::string port, std::string target) {
@@ -100,14 +118,11 @@ namespace md {
                                   self->port_ = std::move(port);
                                   self->target_ = std::move(target);
 
-                                  self->opened_ = false;
-                                  self->close_notified_.store(false, std::memory_order_release);
-
                                   // Configure hostname verification for this host
                                   if (self->tls_verify_peer_) {
                                       self->ws_.next_layer().set_verify_mode(ssl::verify_peer);
                                       self->ws_.next_layer().set_verify_callback(
-                                          ssl::rfc2818_verification(self->host_));
+                                          ssl::host_name_verification(self->host_));
                                   } else {
                                       self->ws_.next_layer().set_verify_mode(ssl::verify_none);
                                   }
@@ -178,6 +193,7 @@ namespace md {
             host_, target_,
             boost::asio::bind_executor(strand_,
                                        [self](const beast::error_code &ec) {
+                                           if (self->closing_) return; // prevent late continuation
                                            if (ec) return self->fail_(ec, "ws_handshake");
 
                                            self->disarm_connect_deadline_();
@@ -246,7 +262,21 @@ namespace md {
             while (self->outbox_.size() >= self->max_outbox_) {
                 self->outbox_.pop_front();
             }
-            self->outbox_.push_back(std::move(text));
+            self->outbox_.push_back({std::move(text), false});
+            if (self->opened_) self->start_write_();
+        });
+    }
+
+    void WsClient::send_binary(std::string data) {
+        auto self = shared_from_this();
+        boost::asio::dispatch(strand_, [self, data = std::move(data)]() mutable {
+            if (self->closing_) return;
+
+            if (self->max_outbox_ == 0) return;
+            while (self->outbox_.size() >= self->max_outbox_) {
+                self->outbox_.pop_front();
+            }
+            self->outbox_.push_back({std::move(data), true});
             if (self->opened_) self->start_write_();
         });
     }
@@ -263,9 +293,12 @@ namespace md {
         if (outbox_.empty()) return;
         write_in_flight_ = true;
 
+        // H1: set text/binary opcode per frame.
+        ws_.text(!outbox_.front().binary);
+
         auto self = shared_from_this();
         ws_.async_write(
-            boost::asio::buffer(outbox_.front()),
+            boost::asio::buffer(outbox_.front().data),
             boost::asio::bind_executor(strand_,
                                        [self](const beast::error_code &ec, std::size_t) {
                                            self->write_in_flight_ = false;

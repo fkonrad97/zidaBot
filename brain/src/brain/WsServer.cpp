@@ -181,10 +181,10 @@ void WsSession::do_read_() {
                 return;
             }
 
-            if (self->ws_.got_text()) {
+            if (self->ws_.got_text() || self->ws_.got_binary()) {
                 const std::string data = beast::buffers_to_string(self->buffer_.data());
                 try {
-                    self->on_message_(std::string_view{data});
+                    self->on_message_(std::string_view{data}, self->ws_.got_binary());
                 } catch (...) {}
             }
 
