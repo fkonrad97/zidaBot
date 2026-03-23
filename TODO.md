@@ -111,9 +111,9 @@ Current single-threaded `io_context` is correct and sufficient for 2–10 symbol
 | # | Item | Priority | Status | Notes |
 |---|---|---|---|---|
 | G1 | Per-handler thread isolation: one `io_context` + one thread per `GenericFeedHandler`; eliminates single-thread bottleneck for 20+ symbols without strand refactoring | MEDIUM | ✅ Done | `main_ioc` for health/signals; per-handler ioc+thread; work guards; `state_`/`ctr_resyncs_` made atomic for cross-thread health reads |
-| G2 | Thread-pool `io_context`: call `ioc.run()` from N threads to parallelise handlers; requires strand protection on `GenericFeedHandler` internal state (`state_`, `buffer_`, counters) | LOW | ⬜ Not Started | `WsClient`/`RestClient` already strand-safe; `GenericFeedHandler` is not yet |
-| G3 | CPU offload: move JSON parsing off the I/O thread onto a `thread_pool`; post results back via `dispatch()`; eliminates parse latency without touching handler state model | LOW | ⬜ Not Started | Worthwhile if symbol count grows beyond ~20 or heavier per-message analytics are added |
-| G4 | Brain multithreaded architecture: brain runs `ioc.run()` on one thread; arb scan and JSON parsing compete with I/O callbacks. Options: dedicated scan thread fed by lock-free queue; or strand-per-session (WsServer already uses strands) + separate scan thread owning `UnifiedBook`+`ArbDetector` | MEDIUM | ⬜ Not Started | Only matters at high venue/symbol counts or when scan CPU dominates; measure with F5 latency first |
+| G2 | Brain I/O thread pool: call `ioc.run()` from N threads (min 2, max 4, capped at `hardware_concurrency`) to allow concurrent TLS handshakes and reads across all PoP sessions | LOW | ✅ Done | `brain/app/brain.cpp` | Safe: WsServer sessions already use strands; signal handler calls `ioc.stop()` — all threads exit cleanly |
+| G3 | Async `FilePersistSink`: move disk writes (gzwrite+flush, ofstream+flush, rotation) off the handler I/O thread onto a bounded internal writer thread (queue cap 10k, drop-oldest) | LOW | ✅ Done | `pop/include/postprocess/FilePersistSink.hpp`, `pop/src/postprocess/FilePersistSink.cpp` | Handler thread enqueues pre-serialised `j.dump()` string and returns immediately; writer thread owns all file handles; destructor signals + joins before process exits |
+| G4 | Brain multithreaded architecture: brain runs `ioc.run()` on one thread; arb scan and JSON parsing compete with I/O callbacks. Options: dedicated scan thread fed by lock-free queue; or strand-per-session (WsServer already uses strands) + separate scan thread owning `UnifiedBook`+`ArbDetector` | MEDIUM | ✅ Done | Dedicated scan thread owns `book`+`arb`; I/O thread deserializes + enqueues (mutex+condvar, 50k cap); `HealthSnapshot` replaces direct cross-thread reads; clean join on shutdown |
 
 ---
 
@@ -142,6 +142,74 @@ JSONL data and strategy research. Full design in `docs/backtest.md`.
 
 ---
 
+## Batch 11 — ✅ Complete (2026-03-23)
+
+G2 brain I/O thread pool + G3 async `FilePersistSink`.
+
+### Why these two were paired
+
+After G1 (each PoP handler on its own thread) and G4 (brain scan thread), the two remaining
+single-threaded bottlenecks were:
+- Brain's `ioc.run()` called from one thread — all WS sessions (one per PoP) serialised
+- `FilePersistSink::write_line_()` blocking the handler's I/O thread on every `gzflush`/`ofstream::flush`
+
+Both were LOW-priority improvements but required minimal blast radius (3 files total, no
+interface changes) so they were batched together.
+
+### G2 — Brain I/O thread pool (`brain/app/brain.cpp`)
+
+**Problem:** Brain ran one thread calling `ioc.run()`. With 2+ PoPs connected, each session's
+TLS handshake, async read, and `on_message` callback all serialised on that single thread.
+Head-of-line blocking: a slow TLS handshake from one PoP delayed reads from all others.
+
+**Solution:** Replace `ioc.run()` with a pool of `N = min(max(2, hw_concurrency), 4)` threads,
+all calling `ioc.run()` on the same `io_context`. This is safe because:
+- `WsServer` creates each session's socket with `net::make_strand(ioc_)` — all reads/writes
+  for a given session are strand-serialised, so no data race within a session
+- `HealthServer`, `watchdog_timer`, and `signal_set` handlers are dispatched through Asio's
+  implicit strand — safe for concurrent `ioc.run()` callers
+- The `on_message` lambda pushes to `event_queue` under `event_mu` — already mutex-guarded since G4
+- Shutdown: signal handler calls `ioc.stop()` — all N threads unblock from `run()` simultaneously
+
+**Change:** 8 lines in `brain/app/brain.cpp` (replaces one `ioc.run()` call).
+Logs `[brain] I/O thread pool: N threads` at startup.
+
+### G3 — Async `FilePersistSink` (`pop/include/postprocess/FilePersistSink.hpp`, `pop/src/postprocess/FilePersistSink.cpp`)
+
+**Problem:** `FilePersistSink::write_line_()` was called synchronously from `write_snapshot()`,
+`write_incremental()`, and `write_book_state()` — all on the handler's I/O thread (the same thread
+that reads from the exchange WebSocket). It performed `j.dump()` (CPU), then `gzwrite()` +
+`gzflush(Z_SYNC_FLUSH)` (blocks until kernel flushes compressed bytes to disk) or
+`ofstream::flush()`. On a disk stall, IO congestion, or rotation (`std::rename`), the handler
+thread was blocked and could not read the next WebSocket message — causing kernel TCP receive
+buffer buildup and potential exchange-side disconnection.
+
+`WsPublishSink` (the brain-bound sink) already used a non-blocking outbox queue; `FilePersistSink`
+was the only remaining sink that blocked the hot path.
+
+**Solution:** Added an internal writer thread to `FilePersistSink`:
+- `enqueue_line_(std::string)` — called on handler thread; locks, pushes to `std::queue<std::string>`,
+  notifies, returns immediately. Cap: 10,000 entries; drops oldest on overflow (freshness policy).
+- `writer_loop_()` — background thread; waits on condvar, pops, does `gzwrite+gzflush` or
+  `ofstream<<+flush`; also owns file rotation (`rotate_()`) and file handle close on exit.
+- JSON serialisation (`j.dump()`) stays on the handler thread — it's CPU-only and fast;
+  only disk I/O moves to the background.
+- `is_open()` now reads `std::atomic<bool> file_open_` — safe to call from the handler thread
+  while the writer thread owns the file handles.
+- Destructor: `writer_running_=false` + `notify_all` + `join` — queue is fully drained before
+  the process exits, so no data is lost on clean shutdown.
+- `persist_seq_` is incremented on the calling thread before enqueue — sequence order preserved.
+
+**Change:** 60 lines added across `.hpp` and `.cpp`; 3 call sites (`write_snapshot`,
+`write_incremental`, `write_book_state`) updated from `write_line_(j)` to `enqueue_line_(j.dump() + '\n')`.
+
+| # | Item | Status |
+|---|---|---|
+| G2 | Brain `ioc.run()` replaced with `N`-thread pool; startup log added | ✅ Done |
+| G3 | `FilePersistSink` write queue + background writer thread; `is_open()` atomicised | ✅ Done |
+
+---
+
 ## Batch 10 — ⬜ Planned
 
 Python backtest environment (Track I, items I1 + I2 + I3).
@@ -152,6 +220,19 @@ Python backtest environment (Track I, items I1 + I2 + I3).
 | I2 | `python/zidabot.cpp` pybind11 module + `python/CMakeLists.txt` + FetchContent pybind11 | ⬜ |
 | I3 | `python/example_backtest.py` replay script | ⬜ |
 | — | Add `add_subdirectory(python)` to root `CMakeLists.txt` | ⬜ |
+
+---
+
+## Batch 10 — ✅ Complete (2026-03-23)
+
+G4 brain dedicated scan thread.
+
+| # | Item | Status |
+|---|---|---|
+| G4 | Event queue (`std::deque<nlohmann::json>`, mutex+condvar, 50k cap) between I/O thread and scan thread | ✅ Done |
+| G4 | Scan thread owns `UnifiedBook` + `ArbDetector`; calls `on_event()` + `scan()` without blocking I/O | ✅ Done |
+| G4 | `HealthSnapshot` struct updated by scan thread (under `health_mu`); health + watchdog callbacks read snapshot — no direct cross-thread access to `book`/`arb` | ✅ Done |
+| G4 | Shutdown: `scan_running=false` + `notify_all` → scan thread exits loop → `join` before `arb.flush()` | ✅ Done |
 
 ---
 

@@ -1,10 +1,15 @@
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
+#include <cstdint>
 #include <fstream>
+#include <mutex>
+#include <queue>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
-#include <cstdint>
 
 #include <nlohmann/json.hpp>
 #include <zlib.h>
@@ -21,7 +26,7 @@ namespace md {
                         std::uint64_t max_file_bytes = 0);
         ~FilePersistSink();
 
-        [[nodiscard]] bool is_open() const noexcept { return out_.is_open() || gz_out_ != nullptr; }
+        [[nodiscard]] bool is_open() const noexcept { return file_open_.load(std::memory_order_relaxed); }
 
         void write_snapshot(const GenericSnapshotFormat &snap, std::string_view source) noexcept;
         void write_incremental(const GenericIncrementalFormat &inc, std::string_view source) noexcept;
@@ -35,9 +40,12 @@ namespace md {
         static std::int64_t now_ns_() noexcept;
         static nlohmann::json levels_to_json_(const std::vector<Level> &levels);
         static nlohmann::json levels_from_book_(const OrderBook &book, std::size_t top_n, Side side);
-        void write_line_(const nlohmann::json &j) noexcept;
+        /// G3: enqueue a pre-serialized line from the handler thread (non-blocking).
+        void enqueue_line_(std::string line) noexcept;
+        /// G3: background writer loop — owns all disk I/O.
+        void writer_loop_() noexcept;
         [[nodiscard]] bool use_gzip_() const noexcept;
-        /// D3: rotate plain JSONL output when size limit is reached.
+        /// D3: rotate plain JSONL output when size limit is reached (called from writer thread).
         void rotate_() noexcept;
 
     private:
@@ -50,5 +58,14 @@ namespace md {
         std::uint64_t max_file_bytes_{0};  ///< D3: 0 = no rotation
         std::uint64_t bytes_written_{0};   ///< D3: bytes written to current file
         std::uint32_t rotate_seq_{0};      ///< D3: rotation counter
+
+        // G3: async writer
+        static constexpr std::size_t kWriteQueueCap = 10'000;
+        std::queue<std::string>   write_queue_;
+        std::mutex                write_mu_;
+        std::condition_variable   write_cv_;
+        std::atomic<bool>         writer_running_{false};
+        std::atomic<bool>         file_open_{false};   ///< thread-safe is_open()
+        std::thread               writer_thread_;
     };
 }
