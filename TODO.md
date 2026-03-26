@@ -4,6 +4,26 @@
 
 ---
 
+## Batch 13 — ⬜ Planned
+
+Execution layer MVP: signal broadcast from brain + exec process with pluggable strategies and E1–E5 safety guards.
+
+| # | Item | Status |
+|---|---|---|
+| ES1 | `ArbDetector::on_cross_` callback hook (2 lines) | ⬜ Not Started |
+| ES2 | `SignalServer` outbound WS push in brain | ⬜ Not Started |
+| ES3 | Brain wiring: `BrainCmdLine` signal flags + `brain.cpp` callback | ⬜ Not Started |
+| EX1 | `exec/` subproject scaffold + CMakeLists | ⬜ Not Started |
+| EX2 | `IOrderClient` interface + `StubOrderClient` | ⬜ Not Started |
+| EX3 | `IExecStrategy` interface + `ImmediateStrategy` (MVP strategy) | ⬜ Not Started |
+| EX4 | `ExecEngine` with E1–E4 guards | ⬜ Not Started |
+| EX5 | `OrderTracker` E5 confirmation timeout + hedge | ⬜ Not Started |
+| EX6 | `ExecCmdLine` + `exec.cpp` main | ⬜ Not Started |
+
+Post-MVP strategies (`ThresholdStrategy`, `SliceStrategy`) tracked as EE1/EE2 in Track E.
+
+---
+
 ## Track A — Correctness & Security Fixes
 
 All items in this track are complete.
@@ -74,17 +94,35 @@ Needed to run the engine unattended and debug incidents.
 
 ---
 
-## Track E — Execution Layer Safety
+## Track E — Execution Layer
 
-Applies only once an order-sending layer is built. Not currently implemented.
+Full design in `docs/EXECUTION_LAYER_PLAN.md`.
 
-| # | Item | Priority | Status | Notes |
-|---|---|---|---|---|
-| E1 | Position limits: max open notional per venue before new signal legs are blocked | HIGH | ⬜ Future | requires execution adapter |
-| E2 | Kill switch: SIGUSR1 pauses signal emission without stopping data collection | HIGH | ⬜ Future | |
-| E3 | Signal dedup / cooldown: suppress repeat signals for the same (sell, buy) pair within a configurable window | HIGH | ⬜ Future | `brain/src/brain/ArbDetector.cpp` |
-| E4 | Fat-finger guard: max notional per leg must not exceed configured ceiling | HIGH | ⬜ Future | requires execution adapter |
-| E5 | Confirmation timeout + hedge: if a fill is not confirmed within N ms, trigger opposing hedge | MEDIUM | ⬜ Future | requires execution adapter |
+### E — Signal Infrastructure (brain side)
+
+| # | Item | Priority | Status | Files | Notes |
+|---|---|---|---|---|---|
+| ES1 | `ArbDetector::on_cross_` callback hook: `std::function<void(const ArbCross &)>` member; invoked in `emit_()` after file write | HIGH | ⬜ Not Started | `brain/include/brain/ArbDetector.hpp`, `brain/src/brain/ArbDetector.cpp` | 2-line change; unblocks all downstream work |
+| ES2 | `SignalServer`: outbound-only Boost.Beast WS server; `broadcast(text)` pushes ArbCross JSON to all connected exec clients; session outbox + strand; mTLS optional; max 10 subscribers | HIGH | ⬜ Not Started | `brain/include/brain/SignalServer.hpp`, `brain/src/brain/SignalServer.cpp` | Pattern: `WsServer`/`WsSession` |
+| ES3 | Wire `SignalServer` in brain: `BrainCmdLine` adds `--signal-port`, `--signal-certfile/keyfile/ca-certfile`; `brain.cpp` instantiates `SignalServer`, sets `arb.on_cross_` to `signal_server.broadcast(...)` | HIGH | ⬜ Not Started | `brain/include/brain/BrainCmdLine.hpp`, `brain/app/brain.cpp` | |
+
+### E — Exec Process (venue side)
+
+| # | Item | Priority | Status | Files | Notes |
+|---|---|---|---|---|---|
+| EX1 | `exec` subproject scaffold: `exec/CMakeLists.txt`; links `common_core`; `add_subdirectory(exec)` in root | HIGH | ⬜ Not Started | `exec/CMakeLists.txt`, `CMakeLists.txt` | |
+| EX2 | `IOrderClient` pure interface: `Order`/`Fill` structs, `submit_order()`, `cancel_order()` callbacks; `StubOrderClient` logs + fires immediate synthetic fill | HIGH | ⬜ Not Started | `exec/include/exec/IOrderClient.hpp`, `exec/include/exec/StubOrderClient.hpp` | |
+| EX3 | `IExecStrategy` pure interface: `on_signal(ArbCross)`, `pause()`, `resume()`; constructed with `IOrderClient&`, `OrderTracker&`, Asio strand; `ImmediateStrategy` (single market order, level-0 qty) as first implementation | HIGH | ⬜ Not Started | `exec/include/exec/IExecStrategy.hpp`, `exec/include/exec/ImmediateStrategy.hpp` | New strategies only need to implement this interface |
+| EX4 | `ExecEngine`: E1 position limit, E2 kill switch (SIGUSR1), E3 signal dedup/cooldown, E4 fat-finger notional cap; calls `strategy_->on_signal()` after all guards pass | HIGH | ⬜ Not Started | `exec/include/exec/ExecEngine.hpp`, `exec/src/exec/ExecEngine.cpp` | |
+| EX5 | `OrderTracker` (E5): Asio steady_timer per pending order; on expiry logs TIMEOUT and submits opposing hedge via `IOrderClient` | MEDIUM | ⬜ Not Started | `exec/include/exec/OrderTracker.hpp`, `exec/src/exec/OrderTracker.cpp` | |
+| EX6 | `ExecCmdLine` + `exec.cpp` main: connects to brain `SignalServer` via `WsClient`; parses `--venue`, `--brain-signal-host/port`, guard params, `--strategy`; strategy factory selects `ImmediateStrategy` | HIGH | ⬜ Not Started | `exec/include/exec/ExecCmdLine.hpp`, `exec/app/exec.cpp` | |
+
+### E — Extended Strategies (post-MVP)
+
+| # | Item | Priority | Status | Files | Notes |
+|---|---|---|---|---|---|
+| EE1 | `ThresholdStrategy`: spread-filter decorator wrapping any inner `IExecStrategy`; skips if `spread_bps < --min-spread-bps` | MEDIUM | ⬜ Not Started | `exec/include/exec/ThresholdStrategy.hpp` | Composable wrapper |
+| EE2 | `SliceStrategy`: sliced execution with three sizing modes — `equal` (N equal slices), `decay` (geometric decay), `weighted` (custom weight vector); inter-slice delay via Asio timers | LOW | ⬜ Not Started | `exec/include/exec/SliceStrategy.hpp`, `exec/src/exec/Strategies.cpp` | |
 
 ---
 
@@ -135,10 +173,10 @@ JSONL data and strategy research. Full design in `docs/backtest.md`.
 
 | # | Item | Priority | Status | Notes |
 |---|---|---|---|---|
-| I1 | `BacktestEngine` C++ class: thin synchronous wrapper around `UnifiedBook` + `ArbDetector`; no threads, no TLS, no file I/O; `feed_event(json_line) → vector<ArbCross>` | HIGH | ⬜ Not Started | `ArbDetector::scan()` already returns `vector<ArbCross>`; production brain ignores it — no existing code changes needed |
-| I2 | pybind11 binding module (`python/zidabot.cpp`): expose `BacktestEngine`, `ArbCross`, `BBO`; `pybind11/stl.h` for automatic `vector<ArbCross>` → `list[ArbCross]` | HIGH | ⬜ Not Started | FetchContent pybind11 v2.13.1; `pybind11_add_module(zidabot ...)`; build with `--target zidabot` |
-| I3 | `python/example_backtest.py`: minimal working replay script (JSONL/.gz → pandas DataFrame); ships as usage reference | MEDIUM | ⬜ Not Started | Depends on I1 + I2 |
-| I4 | Depth curve access: expose full bid/ask level arrays per venue per event for feature engineering (spread series, book imbalance, etc.) | LOW | ⬜ Not Started | Requires binding `OrderBook::bid_ptr(i)` / `ask_ptr(i)`; defer until basic API is proven |
+| I1 | `BacktestEngine` C++ class: thin synchronous wrapper around `UnifiedBook` + `ArbDetector`; no threads, no TLS, no file I/O; `feed_event(json_line) → vector<ArbCross>` | HIGH | ✅ Done | `brain/include/brain/BacktestEngine.hpp`, `brain/src/brain/BacktestEngine.cpp` |
+| I2 | `zidabot_replay` subprocess binary: reads JSONL from stdin, writes ArbCross JSON to stdout; Python pipes data through it (pybind11 skipped — spdlog TLS incompatibility with dlopen) | HIGH | ✅ Done | `brain/app/zidabot_replay.cpp`; `cmake --build build --target zidabot_replay` |
+| I3 | `python/example_backtest.py`: subprocess-based replay helper + pandas DataFrame output; `docs/HOWTO.md` section 13 | MEDIUM | ✅ Done | |
+| I4 | Depth curve access: `--emit-books` flag on zidabot_replay emits `{"type":"book"}` depth curve lines; `BacktestEngine::levels()` + `last_updated_venue()` | LOW | ✅ Done | `brain/include/brain/BacktestEngine.hpp`, `brain/app/zidabot_replay.cpp` |
 
 ---
 
@@ -210,16 +248,19 @@ was the only remaining sink that blocked the hot path.
 
 ---
 
-## Batch 10 — ⬜ Planned
+## Batch 12 — ✅ Complete (2026-03-25)
 
 Python backtest environment (Track I, items I1 + I2 + I3).
 
+pybind11 was attempted but abandoned — GCC's `static thread_local` guard variables in
+spdlog produce `R_X86_64_TPOFF32` relocations incompatible with any dlopen'd shared
+library regardless of `-fPIC`. Replaced with a subprocess binary approach.
+
 | # | Item | Status |
 |---|---|---|
-| I1 | `brain/include/brain/BacktestEngine.hpp` + `brain/src/brain/BacktestEngine.cpp` | ⬜ |
-| I2 | `python/zidabot.cpp` pybind11 module + `python/CMakeLists.txt` + FetchContent pybind11 | ⬜ |
-| I3 | `python/example_backtest.py` replay script | ⬜ |
-| — | Add `add_subdirectory(python)` to root `CMakeLists.txt` | ⬜ |
+| I1 | `brain/include/brain/BacktestEngine.hpp` + `brain/src/brain/BacktestEngine.cpp` | ✅ Done |
+| I2 | `brain/app/zidabot_replay.cpp` subprocess binary (stdin JSONL → stdout JSON crosses) | ✅ Done |
+| I3 | `python/example_backtest.py` subprocess-based replay helper + `docs/HOWTO.md` §13 | ✅ Done |
 
 ---
 

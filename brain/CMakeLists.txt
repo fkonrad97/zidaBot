@@ -32,3 +32,7 @@ endif()
 add_executable(brain app/brain.cpp)
 target_link_libraries(brain PRIVATE brain_core)
 set_target_properties(brain PROPERTIES OUTPUT_NAME "brain")
+
+add_executable(zidabot_replay app/zidabot_replay.cpp)
+target_link_libraries(zidabot_replay PRIVATE brain_core)
+set_target_properties(zidabot_replay PROPERTIES OUTPUT_NAME "zidabot_replay")

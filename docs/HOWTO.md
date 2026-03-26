@@ -18,6 +18,7 @@ End-to-end guide covering prerequisites, build, TLS/mTLS setup, config files, an
 10. [Troubleshooting](#10-troubleshooting)
 11. [Health Endpoint](#11-health-endpoint)
 12. [Production Deployment (systemd / supervisord)](#12-production-deployment-systemd--supervisord)
+13. [Backtesting with zidabot_replay](#13-backtesting-with-zidabot_replay)
 
 ---
 
@@ -670,3 +671,238 @@ Both processes handle `SIGINT` and `SIGTERM` gracefully:
 - Exit with code 0
 
 systemd sends `SIGTERM` on `systemctl stop`, waits up to `TimeoutStopSec=10s`, then sends `SIGKILL` if needed.
+
+---
+
+## 13. Backtesting with zidabot_replay
+
+`zidabot_replay` is a standalone binary that replays historical JSONL files produced by
+PoP's `--persist_path` through the **exact same** C++ arb detection engine that runs in
+production (same `UnifiedBook`, same `ArbDetector`, same staleness guards). No TLS, no
+WebSocket, no threads — pure stdin → stdout.
+
+### Build
+
+```bash
+cmake --build build -j4 --target zidabot_replay
+# Output: build/brain/zidabot_replay
+```
+
+### Basic usage
+
+```bash
+# Replay two venues, print every cross detected
+zcat persist/pop-data/2026-03-05-20-27-39/binance.jsonl.gz \
+     persist/pop-data/2026-03-05-20-27-39/okx.jsonl.gz \
+  | ./build/brain/zidabot_replay
+
+# Filter to crosses ≥ 0.5 bps
+zcat binance.jsonl.gz okx.jsonl.gz \
+  | ./build/brain/zidabot_replay --min-spread-bps 0.5
+```
+
+Each detected cross is written as one JSON line to stdout:
+
+```json
+{
+  "sell_venue": "binance",
+  "buy_venue": "okx",
+  "sell_bid_tick": 5000500,
+  "buy_ask_tick":  4999000,
+  "spread_bps": 3.0,
+  "ts_detected_ns":  1774474171337645757,
+  "sell_ts_book_ns": 1774474171333554792,
+  "buy_ts_book_ns":  1774474171333554792,
+  "lag_ns": 4090965
+}
+```
+
+- `sell_bid_tick` / `buy_ask_tick` are integer ticks (`price × 100`), no float rounding
+- `lag_ns = ts_detected_ns − max(sell_ts_book_ns, buy_ts_book_ns)` — detection latency
+- Log output (venue registration, sync events) goes to **stderr**; cross JSON goes to **stdout** — easy to separate
+
+### Flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--depth` | 50 | Order book depth per venue |
+| `--min-spread-bps` | 0 | Suppress crosses below this threshold (bps) |
+| `--max-spread-bps` | 0 | Suppress crosses above this threshold, 0 = no cap |
+| `--rate-limit-ms` | 0 | Min ms between signals per (sell, buy) pair; 0 = unlimited (recommended for backtesting) |
+| `--max-age-ms` | 5000 | Max individual book age for arb scan (ms) |
+| `--max-price-deviation-pct` | 0 | Exclude venue if best_bid deviates > N% from median across synced venues; 0 = off |
+| `--emit-books` | off | Emit a `{"type":"book"}` depth curve line after every event (see below) |
+| `--book-depth` | 0 | Levels per side in book output; 0 = full configured depth |
+| `--log-level` | warn | Log verbosity to stderr: `debug`\|`info`\|`warn`\|`error` |
+
+> **Note:** `--rate-limit-ms` defaults to 0 (unlimited) unlike production brain (default 1000 ms). In backtesting you want every cross, not just the rate-limited subset.
+
+### Input format
+
+Input must be raw JSONL lines in the format written by PoP's `--persist_path` — the same three event types (`snapshot`, `incremental`, `book_state`) plus `status` events. All four are handled exactly as the live brain handles them.
+
+**Source a single venue file:**
+```bash
+zcat binance.jsonl.gz | ./build/brain/zidabot_replay
+```
+
+**Interleave multiple venues (strict chronological order via merge-sort):**
+
+For accurate cross-venue timestamps, events should be in global time order. The simplest approach is to merge-sort by `ts_recv_ns` before piping:
+
+```bash
+python3 - <<'EOF'
+import gzip, heapq, sys
+
+files = sys.argv[1:]
+iters = [((json.loads(l)["ts_recv_ns"] if "ts_recv_ns" in (j:=json.loads(l)) else j.get("ts_book_ns",0)), l)
+         for path in files
+         for l in gzip.open(path, "rt")]
+import json
+streams = []
+for path in files:
+    def gen(p=path):
+        with gzip.open(p, "rt") as f:
+            for line in f:
+                d = json.loads(line)
+                yield d.get("ts_recv_ns", d.get("ts_book_ns", 0)), line.rstrip()
+    streams.append(gen())
+for _, line in heapq.merge(*streams, key=lambda x: x[0]):
+    print(line)
+EOF binance.jsonl.gz okx.jsonl.gz | ./build/brain/zidabot_replay
+```
+
+Or just concatenate if approximate ordering is acceptable (venues are independent books):
+```bash
+zcat binance.jsonl.gz okx.jsonl.gz | ./build/brain/zidabot_replay
+```
+
+### Python integration
+
+`python/example_backtest.py` wraps the binary in a Python `replay()` function and outputs a pandas DataFrame:
+
+```bash
+python3 python/example_backtest.py \
+  --binary ./build/brain/zidabot_replay \
+  persist/pop-data/2026-03-05-20-27-39/binance.jsonl.gz \
+  persist/pop-data/2026-03-05-20-27-39/okx.jsonl.gz \
+  --min-spread-bps 0.5
+```
+
+In a notebook or script:
+
+```python
+import gzip, json, subprocess
+
+def replay(files, binary="./build/brain/zidabot_replay", **kwargs):
+    cmd = [binary]
+    for k, v in kwargs.items():
+        cmd += [f"--{k.replace('_','-')}", str(v)]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    crosses = []
+    for path in files:
+        with gzip.open(path, "rt") as f:
+            for line in f:
+                proc.stdin.write(line)
+                proc.stdin.flush()
+                out = proc.stdout.readline()
+                if out.strip():
+                    crosses.append(json.loads(out))
+    proc.stdin.close()
+    proc.wait()
+    return crosses
+
+crosses = replay(
+    ["persist/pop-data/.../binance.jsonl.gz",
+     "persist/pop-data/.../okx.jsonl.gz"],
+    min_spread_bps=0.5,
+)
+
+import pandas as pd
+df = pd.DataFrame(crosses)
+print(df.groupby(["sell_venue", "buy_venue"])["spread_bps"].describe())
+```
+
+### Depth curves (`--emit-books`)
+
+`--emit-books` adds a `{"type":"book"}` line to stdout after every event, showing the
+full bid/ask level stack for the updated venue. Use this for feature engineering:
+spread time-series, book imbalance, slippage estimates, and multi-level arb sizing.
+
+```bash
+zcat binance.jsonl.gz okx.jsonl.gz \
+  | ./build/brain/zidabot_replay --emit-books --book-depth 10 2>/dev/null \
+  > stream.jsonl
+```
+
+Each book line:
+```json
+{
+  "type": "book",
+  "venue": "binance",
+  "ts_ns": 1774474890118230065,
+  "bids": [[9520000, 50], [9519000, 120], ...],
+  "asks": [[9521000, 80], ...]
+}
+```
+
+- `bids` / `asks` are arrays of `[price_tick, qty_lot]` pairs
+- `bids` sorted descending (best bid first); `asks` ascending (best ask first)
+- `price_tick = price × 100` (integer, no float rounding)
+
+Cross lines are emitted on the same stream with `"type":"cross"`. Filter in Python:
+
+```python
+import gzip, json, subprocess
+
+proc = subprocess.Popen(
+    ['./build/brain/zidabot_replay', '--emit-books', '--book-depth', '10'],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+)
+
+books, crosses = [], []
+for path in ['binance.jsonl.gz', 'okx.jsonl.gz']:
+    with gzip.open(path, 'rt') as f:
+        for line in f:
+            proc.stdin.write(line)
+            proc.stdin.flush()
+            out = proc.stdout.readline()
+            if not out.strip():
+                continue
+            d = json.loads(out)
+            if d['type'] == 'book':
+                books.append(d)
+            elif d['type'] == 'cross':
+                crosses.append(d)
+proc.stdin.close()
+proc.wait()
+
+import pandas as pd
+# Spread time series (top-of-book)
+book_df = pd.DataFrame([
+    {'venue': b['venue'], 'ts_ns': b['ts_ns'],
+     'bid': b['bids'][0][0] if b['bids'] else None,
+     'ask': b['asks'][0][0] if b['asks'] else None}
+    for b in books
+])
+
+# Book imbalance: (bid_qty_total - ask_qty_total) / (bid_qty_total + ask_qty_total)
+def imbalance(b):
+    bid_qty = sum(l[1] for l in b['bids'])
+    ask_qty = sum(l[1] for l in b['asks'])
+    total = bid_qty + ask_qty
+    return (bid_qty - ask_qty) / total if total else 0.0
+
+book_df['imbalance'] = [imbalance(b) for b in books]
+```
+
+### Save crosses to a file
+
+```bash
+zcat binance.jsonl.gz okx.jsonl.gz \
+  | ./build/brain/zidabot_replay --min-spread-bps 0 2>/dev/null \
+  > crosses.jsonl
+
+wc -l crosses.jsonl                          # total crosses
+jq '.spread_bps' crosses.jsonl | sort -n    # spread distribution
+```
