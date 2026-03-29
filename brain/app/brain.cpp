@@ -22,39 +22,60 @@
 #include "brain/WsServer.hpp"
 #include "utils/HealthServer.hpp"
 #include "utils/Log.hpp"
+#include "brain/SignalServer.hpp"
 
 // ---------------------------------------------------------------------------
 // G4: Health snapshot — written by the scan thread after every event,
 // read by the health/watchdog callbacks on the I/O thread.
 // ---------------------------------------------------------------------------
-struct VenueSnap {
-    std::string  venue_name;
-    std::string  symbol;
-    std::string  state;        // "synced" | "feed_down" | "syncing"
-    bool         feed_healthy{false};
+struct VenueSnap
+{
+    std::string venue_name;
+    std::string symbol;
+    std::string state; // "synced" | "feed_down" | "syncing"
+    bool feed_healthy{false};
     std::int64_t ts_book_ns{0};
 };
 
-struct HealthSnapshot {
-    std::size_t  synced{0};
-    std::size_t  total{0};
+struct HealthSnapshot
+{
+    std::size_t synced{0};
+    std::size_t total{0};
     std::int64_t last_cross_ns{0};
     brain::LatencyHistogram::Percentiles latency{};
-    bool         standby{false};
+    bool standby{false};
     std::vector<VenueSnap> venues;
 };
 
-int main(int argc, char **argv) {
+static std::string serialize_cross(const brain::ArbCross &c)
+{
+    nlohmann::json j;
+    j["ts_detected_ns"] = c.ts_detected_ns;
+    j["sell_venue"] = c.sell_venue;
+    j["buy_venue"] = c.buy_venue;
+    j["sell_bid_tick"] = c.sell_bid_tick;
+    j["buy_ask_tick"] = c.buy_ask_tick;
+    j["spread_bps"] = c.spread_bps;
+    j["sell_ts_book_ns"] = c.sell_ts_book_ns;
+    j["buy_ts_book_ns"] = c.buy_ts_book_ns;
+    return j.dump();
+}
+
+int main(int argc, char **argv)
+{
     brain::BrainOptions opts;
-    if (!brain::parse_brain_cmdline(argc, argv, opts)) return 1;
-    if (opts.show_help) return 0;
+    if (!brain::parse_brain_cmdline(argc, argv, opts))
+        return 1;
+    if (opts.show_help)
+        return 0;
 
     // D1: initialise structured logger before any other output
     md::log::init(opts.log_level);
 
     // ---- TLS context ----
     boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tls_server);
-    try {
+    try
+    {
         ssl_ctx.use_certificate_chain_file(opts.certfile);
         ssl_ctx.use_private_key_file(opts.keyfile, boost::asio::ssl::context::pem);
         ssl_ctx.set_options(
@@ -62,25 +83,26 @@ int main(int argc, char **argv) {
             boost::asio::ssl::context::no_sslv2 |
             boost::asio::ssl::context::no_sslv3 |
             boost::asio::ssl::context::no_tlsv1 |
-            boost::asio::ssl::context::no_tlsv1_1
-        );
+            boost::asio::ssl::context::no_tlsv1_1);
         SSL_CTX_set_cipher_list(ssl_ctx.native_handle(),
-            "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
-            "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:"
-            "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256");
+                                "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
+                                "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:"
+                                "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256");
 
         // F1: mTLS — if a CA cert is provided, require PoP clients to present a
         // certificate signed by that CA.  Without --ca-certfile, brain still accepts
         // any TLS connection (backward-compatible default).
-        if (!opts.ca_certfile.empty()) {
+        if (!opts.ca_certfile.empty())
+        {
             ssl_ctx.load_verify_file(opts.ca_certfile);
             ssl_ctx.set_verify_mode(
                 boost::asio::ssl::verify_peer |
-                boost::asio::ssl::verify_fail_if_no_peer_cert
-            );
+                boost::asio::ssl::verify_fail_if_no_peer_cert);
             spdlog::info("[brain] mTLS enabled: client cert required, CA={}", opts.ca_certfile);
         }
-    } catch (const std::exception &e) {
+    }
+    catch (const std::exception &e)
+    {
         spdlog::error("[brain] TLS setup error: {}", e.what());
         return 1;
     }
@@ -97,13 +119,13 @@ int main(int argc, char **argv) {
         opts.min_spread_bps,
         opts.max_spread_bps,
         opts.rate_limit_ms * 1'000'000LL,
-        opts.max_age_ms    * 1'000'000LL,
+        opts.max_age_ms * 1'000'000LL,
         opts.max_price_deviation_pct,
         opts.output,
-        output_max_bytes
-    );
+        output_max_bytes);
     // F4: standby mode — suppress signal emission until promoted via SIGUSR1
-    if (opts.standby) {
+    if (opts.standby)
+    {
         arb.set_active(false);
         spdlog::warn("[brain] starting in STANDBY mode — promote with: kill -USR1 {}", ::getpid());
     }
@@ -111,34 +133,40 @@ int main(int argc, char **argv) {
     // ---- G4: Event queue shared between I/O thread and scan thread ----
     // I/O thread deserializes and enqueues; scan thread owns book + arb.
     constexpr std::size_t kEventQueueCap = 50'000;
-    std::mutex              event_mu;
+    std::mutex event_mu;
     std::condition_variable event_cv;
     std::deque<nlohmann::json> event_queue;
     std::atomic<bool> scan_running{true};
 
     // ---- G4: Health snapshot shared between scan thread and I/O callbacks ----
-    std::mutex     health_mu;
+    std::mutex health_mu;
     HealthSnapshot health_snapshot;
 
     // Helper: scan thread calls this after every processed event to keep the
     // health/watchdog callbacks current without touching book/arb directly.
-    auto update_health_snapshot = [&]() {
+    auto update_health_snapshot = [&]()
+    {
         const auto &vs = book.venues();
-        const auto  now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
+        const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
 
         HealthSnapshot snap;
-        snap.total          = vs.size();
-        snap.synced         = book.synced_count();
-        snap.last_cross_ns  = arb.last_cross_ns();
-        snap.latency        = arb.latency_percentiles();
-        snap.standby        = !arb.is_active();
+        snap.total = vs.size();
+        snap.synced = book.synced_count();
+        snap.last_cross_ns = arb.last_cross_ns();
+        snap.latency = arb.latency_percentiles();
+        snap.standby = !arb.is_active();
         snap.venues.reserve(vs.size());
-        for (const auto &vb : vs) {
+        for (const auto &vb : vs)
+        {
             std::string st;
-            if (vb.synced())           st = "synced";
-            else if (!vb.feed_healthy) st = "feed_down";
-            else                       st = "syncing";
+            if (vb.synced())
+                st = "synced";
+            else if (!vb.feed_healthy)
+                st = "feed_down";
+            else
+                st = "syncing";
             snap.venues.push_back({vb.venue_name, vb.symbol, st,
                                    vb.feed_healthy, vb.ts_book_ns});
             (void)now_ns; // ts_book_ns stored directly; age_ms computed at read time
@@ -148,7 +176,8 @@ int main(int argc, char **argv) {
     };
 
     // ---- G4: Scan thread ----
-    std::thread scan_thread([&]() {
+    std::thread scan_thread([&]()
+                            {
         spdlog::info("[brain] scan thread started");
         while (scan_running.load(std::memory_order_relaxed)) {
             nlohmann::json j;
@@ -168,21 +197,25 @@ int main(int argc, char **argv) {
             } catch (...) {}
             update_health_snapshot();
         }
-        spdlog::info("[brain] scan thread exiting");
-    });
+        spdlog::info("[brain] scan thread exiting"); });
 
     // ---- Message callback (I/O thread) ----
     // H1: PoP sends MessagePack binary frames; fall back to JSON text for
     // backward compatibility during mixed-version deployments.
     // G4: only deserialize here — push to queue for scan thread.
-    auto on_message = [&](std::string_view msg, bool is_binary) {
-        try {
+    auto on_message = [&](std::string_view msg, bool is_binary)
+    {
+        try
+        {
             nlohmann::json j;
-            if (is_binary) {
+            if (is_binary)
+            {
                 j = nlohmann::json::from_msgpack(
-                        reinterpret_cast<const uint8_t *>(msg.data()),
-                        reinterpret_cast<const uint8_t *>(msg.data()) + msg.size());
-            } else {
+                    reinterpret_cast<const uint8_t *>(msg.data()),
+                    reinterpret_cast<const uint8_t *>(msg.data()) + msg.size());
+            }
+            else
+            {
                 j = nlohmann::json::parse(msg);
             }
             {
@@ -192,9 +225,14 @@ int main(int argc, char **argv) {
                 event_queue.push_back(std::move(j));
             }
             event_cv.notify_one();
-        } catch (const nlohmann::json::exception &e) {
+        }
+        catch (const nlohmann::json::exception &e)
+        {
             spdlog::warn("[brain] parse error: {}", e.what());
-        } catch (...) {}
+        }
+        catch (...)
+        {
+        }
     };
 
     // ---- Server ----
@@ -204,6 +242,22 @@ int main(int argc, char **argv) {
     brain::WsServer server(ioc, ssl_ctx, ep, on_message);
     server.start();
 
+    // ES2: optional outbound signal channel — pushes ArbCross JSON to exec processes.
+    // Disabled when --signal-port is 0 (default).
+    std::unique_ptr<brain::SignalServer> signal_server;
+    if (opts.signal_port > 0)
+    {
+        const boost::asio::ip::tcp::endpoint signal_ep(addr, opts.signal_port);
+        signal_server = std::make_unique<brain::SignalServer>(ioc, ssl_ctx, signal_ep);
+        signal_server->start();
+        spdlog::info("[brain] signal server listening on port {}", opts.signal_port);
+
+        arb.on_cross_ = [&signal_server](const brain::ArbCross &c)
+        {
+            signal_server->broadcast(serialize_cross(c));
+        };
+    }
+
     // ---- D4: Brain watchdog (I/O thread — reads health snapshot) ----
     boost::asio::steady_timer watchdog_timer(ioc);
     const std::int64_t watchdog_no_cross_ns =
@@ -212,9 +266,11 @@ int main(int argc, char **argv) {
             : 0;
 
     std::function<void()> arm_watchdog;
-    arm_watchdog = [&]() {
+    arm_watchdog = [&]()
+    {
         watchdog_timer.expires_after(std::chrono::seconds(60));
-        watchdog_timer.async_wait([&](const boost::system::error_code &ec) {
+        watchdog_timer.async_wait([&](const boost::system::error_code &ec)
+                                  {
             if (ec) return;
 
             // G4: read from snapshot — scan thread owns book/arb directly.
@@ -237,13 +293,13 @@ int main(int argc, char **argv) {
                 }
             }
 
-            arm_watchdog();
-        });
+            arm_watchdog(); });
     };
     arm_watchdog();
 
     // ---- D5: Health endpoint (I/O thread — reads health snapshot) ----
-    md::HealthServer health_server(ioc, opts.health_port, [&]() -> std::string {
+    md::HealthServer health_server(ioc, opts.health_port, [&]() -> std::string
+                                   {
         using nlohmann::json;
         const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
@@ -286,13 +342,13 @@ int main(int argc, char **argv) {
             j["latency_us"] = {{"p50", snap.latency.p50_us}, {"p95", snap.latency.p95_us},
                                {"p99", snap.latency.p99_us}, {"n",   snap.latency.n}};
         }
-        return j.dump();
-    });
+        return j.dump(); });
     health_server.start();
 
     // ---- Signal handling ----
     boost::asio::signal_set signals(ioc, SIGINT, SIGTERM);
-    signals.async_wait([&](const boost::system::error_code &, int) {
+    signals.async_wait([&](const boost::system::error_code &, int)
+                       {
         spdlog::info("[brain] shutting down");
         watchdog_timer.cancel();
         // G4: stop scan thread before flushing arb
@@ -300,29 +356,29 @@ int main(int argc, char **argv) {
         event_cv.notify_all();
         health_server.stop();
         server.stop();
+        if (signal_server) signal_server->stop();
         ioc.stop();
-        md::log::flush();
-    });
+        md::log::flush(); });
 
     // F4: SIGUSR1 promotes standby brain to active
     boost::asio::signal_set promote_signal(ioc, SIGUSR1);
-    promote_signal.async_wait([&](const boost::system::error_code &ec, int) {
+    promote_signal.async_wait([&](const boost::system::error_code &ec, int)
+                              {
         if (ec) return;
         arb.set_active(true);
-        spdlog::warn("[brain] PROMOTED to active (SIGUSR1 received)");
-    });
+        spdlog::warn("[brain] PROMOTED to active (SIGUSR1 received)"); });
 
     spdlog::info("[brain] running depth={} min_spread={}bps max_spread={} rate_limit={} "
                  "max_age={}ms max_price_dev={} output_max={} watchdog_no_cross={} mtls={}",
-        opts.depth,
-        opts.min_spread_bps,
-        opts.max_spread_bps > 0.0 ? std::to_string(opts.max_spread_bps) + "bps" : "no-cap",
-        opts.rate_limit_ms > 0 ? std::to_string(opts.rate_limit_ms) + "ms" : "off",
-        opts.max_age_ms,
-        opts.max_price_deviation_pct > 0.0 ? std::to_string(opts.max_price_deviation_pct) + "%" : "off",
-        opts.output_max_mb > 0 ? std::to_string(opts.output_max_mb) + "MB" : "no-rotation",
-        opts.watchdog_no_cross_sec > 0 ? std::to_string(opts.watchdog_no_cross_sec) + "s" : "off",
-        opts.ca_certfile.empty() ? "off" : "on");
+                 opts.depth,
+                 opts.min_spread_bps,
+                 opts.max_spread_bps > 0.0 ? std::to_string(opts.max_spread_bps) + "bps" : "no-cap",
+                 opts.rate_limit_ms > 0 ? std::to_string(opts.rate_limit_ms) + "ms" : "off",
+                 opts.max_age_ms,
+                 opts.max_price_deviation_pct > 0.0 ? std::to_string(opts.max_price_deviation_pct) + "%" : "off",
+                 opts.output_max_mb > 0 ? std::to_string(opts.output_max_mb) + "MB" : "no-rotation",
+                 opts.watchdog_no_cross_sec > 0 ? std::to_string(opts.watchdog_no_cross_sec) + "s" : "off",
+                 opts.ca_certfile.empty() ? "off" : "on");
 
     // G2: run I/O thread pool — safe because all WsSession handlers use strands.
     const unsigned n_ioc_threads =
@@ -332,11 +388,14 @@ int main(int argc, char **argv) {
     std::vector<std::thread> ioc_threads;
     ioc_threads.reserve(n_ioc_threads);
     for (unsigned i = 0; i < n_ioc_threads; ++i)
-        ioc_threads.emplace_back([&ioc] { ioc.run(); });
-    for (auto &t : ioc_threads) t.join();
+        ioc_threads.emplace_back([&ioc]
+                                 { ioc.run(); });
+    for (auto &t : ioc_threads)
+        t.join();
 
     // G4: wait for scan thread to drain and exit.
-    if (scan_thread.joinable()) scan_thread.join();
+    if (scan_thread.joinable())
+        scan_thread.join();
     arb.flush();
     md::log::flush();
     return 0;

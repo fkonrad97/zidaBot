@@ -80,6 +80,11 @@ void ArbDetector::emit_(const ArbCross &c) {
     spdlog::info("[ARB] sell={} bid={} buy={} ask={} spread={}bps",
                  c.sell_venue, c.sell_bid_tick, c.buy_venue, c.buy_ask_tick, c.spread_bps);
 
+    // ES1: notify external subscriber (e.g. SignalServer) if a callback is registered.
+    // Placed after all internal guards (active_, counters, latency) so only fully
+    // validated crosses reach the execution layer. The if-check is free when unset.
+    if (on_cross_) on_cross_(c);
+
     // Optionally write JSONL
     if (!output_.is_open()) return;
     try {

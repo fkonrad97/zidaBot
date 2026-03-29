@@ -10,9 +10,9 @@ Execution layer MVP: signal broadcast from brain + exec process with pluggable s
 
 | # | Item | Status |
 |---|---|---|
-| ES1 | `ArbDetector::on_cross_` callback hook (2 lines) | ⬜ Not Started |
-| ES2 | `SignalServer` outbound WS push in brain | ⬜ Not Started |
-| ES3 | Brain wiring: `BrainCmdLine` signal flags + `brain.cpp` callback | ⬜ Not Started |
+| ES1 | `ArbDetector::on_cross_` callback hook (2 lines) | ✅ Done |
+| ES2 | `SignalServer` outbound WS push in brain | ✅ Done |
+| ES3 | Brain wiring: `BrainCmdLine` signal flags + `brain.cpp` callback | ✅ Done |
 | EX1 | `exec/` subproject scaffold + CMakeLists | ⬜ Not Started |
 | EX2 | `IOrderClient` interface + `StubOrderClient` | ⬜ Not Started |
 | EX3 | `IExecStrategy` interface + `ImmediateStrategy` (MVP strategy) | ⬜ Not Started |
@@ -102,9 +102,9 @@ Full design in `docs/EXECUTION_LAYER_PLAN.md`.
 
 | # | Item | Priority | Status | Files | Notes |
 |---|---|---|---|---|---|
-| ES1 | `ArbDetector::on_cross_` callback hook: `std::function<void(const ArbCross &)>` member; invoked in `emit_()` after file write | HIGH | ⬜ Not Started | `brain/include/brain/ArbDetector.hpp`, `brain/src/brain/ArbDetector.cpp` | 2-line change; unblocks all downstream work |
-| ES2 | `SignalServer`: outbound-only Boost.Beast WS server; `broadcast(text)` pushes ArbCross JSON to all connected exec clients; session outbox + strand; mTLS optional; max 10 subscribers | HIGH | ⬜ Not Started | `brain/include/brain/SignalServer.hpp`, `brain/src/brain/SignalServer.cpp` | Pattern: `WsServer`/`WsSession` |
-| ES3 | Wire `SignalServer` in brain: `BrainCmdLine` adds `--signal-port`, `--signal-certfile/keyfile/ca-certfile`; `brain.cpp` instantiates `SignalServer`, sets `arb.on_cross_` to `signal_server.broadcast(...)` | HIGH | ⬜ Not Started | `brain/include/brain/BrainCmdLine.hpp`, `brain/app/brain.cpp` | |
+| ES1 | `ArbDetector::on_cross_` callback hook: `std::function<void(const ArbCross &)>` member; invoked in `emit_()` after file write | HIGH | ✅ Done | `brain/include/brain/ArbDetector.hpp`, `brain/src/brain/ArbDetector.cpp` | 2-line change; unblocks all downstream work |
+| ES2 | `SignalServer`: outbound-only Boost.Beast WS server; `broadcast(text)` pushes ArbCross JSON to all connected exec clients; session outbox + strand; mTLS optional; max 10 subscribers | HIGH | ✅ Done | `brain/include/brain/SignalServer.hpp`, `brain/src/brain/SignalServer.cpp` | Pattern: `WsServer`/`WsSession` |
+| ES3 | Wire `SignalServer` in brain: `BrainCmdLine` adds `--signal-port`, `--signal-certfile/keyfile/ca-certfile`; `brain.cpp` instantiates `SignalServer`, sets `arb.on_cross_` to `signal_server.broadcast(...)` | HIGH | ✅ Done | `brain/include/brain/BrainCmdLine.hpp`, `brain/app/brain.cpp` | |
 
 ### E — Exec Process (venue side)
 
@@ -163,6 +163,10 @@ serialised as JSON text frames, which is human-readable but CPU-heavy on both en
 | # | Item | Priority | Status | Notes |
 |---|---|---|---|---|
 | H1 | Binary wire format between PoP and Brain: replace `nlohmann::json` serialisation/deserialisation with MessagePack (drop-in, same schema), FlatBuffers (zero-copy, requires schema), or a custom fixed binary layout. Biggest win is on the brain parse side (hot path, single thread). | MEDIUM | ✅ Done | `nlohmann::json::to_msgpack()` / `from_msgpack()` — zero new deps; WS binary frames; backward-compat text-JSON fallback in brain; `send_binary()` added to `WsClient` |
+| H2 | Replace `nlohmann/json` in PoP exchange feed parsing (hot path — every tick) with simdjson or RapidJSON. nlohmann builds a full DOM with heap allocation per parse; simdjson parses in-place via SIMD with zero allocation. Profile PoP parse time first to quantify the win. | MEDIUM | ⬜ Not Started | Priority order: PoP feed (hottest) → brain ingestion → signal channel |
+| H3 | Replace `nlohmann::from_msgpack()` in brain PoP feed ingestion with a purpose-built msgpack library (mpack or msgpack-c) for zero-copy reads. Currently every incoming PoP frame allocates via nlohmann DOM. | LOW | ⬜ Not Started | Depends on H2 profiling results to confirm this is the next bottleneck |
+| H4 | Replace `nlohmann/json` on the brain→exec signal channel with a fixed-size binary struct or MessagePack. Current JSON is ~200 bytes/signal; binary could reduce to ~64 bytes with zero-allocation parsing on exec side. | LOW | ⬜ Not Started | Revisit after ES1–EX6 (exec layer) complete; signal channel does not exist yet |
+| H5 | Evaluate moving `WsServer`/`WsSession` and `SignalServer`/`SignalSession` into `common/` if a second process ever needs to accept connections. Currently brain-only so they stay in `brain/`; revisit if exec or a future venue-side server needs an acceptor. | LOW | ⬜ Not Started | No action needed until a second acceptor user exists |
 
 ---
 
@@ -261,6 +265,20 @@ library regardless of `-fPIC`. Replaced with a subprocess binary approach.
 | I1 | `brain/include/brain/BacktestEngine.hpp` + `brain/src/brain/BacktestEngine.cpp` | ✅ Done |
 | I2 | `brain/app/zidabot_replay.cpp` subprocess binary (stdin JSONL → stdout JSON crosses) | ✅ Done |
 | I3 | `python/example_backtest.py` subprocess-based replay helper + `docs/HOWTO.md` §13 | ✅ Done |
+
+---
+
+## Batch 13A — ✅ Complete (2026-03-29)
+
+Brain-side execution layer: ArbDetector callback hook + SignalServer outbound WS push + brain.cpp wiring.
+
+| # | Item | Status |
+|---|---|---|
+| ES1 | `ArbDetector::on_cross_` callback: `std::function<void(const ArbCross &)>` member; invoked in `emit_()` after all guards pass | ✅ Done |
+| ES2 | `SignalServer` + `SignalSession`: outbound-only TLS WS server; per-session outbox (kMaxOutbox=64, drop-oldest); `broadcast()` safe from any thread via `net::post()` | ✅ Done |
+| ES3 | `BrainCmdLine` adds `--signal-port`; `brain.cpp` adds `serialize_cross()`, instantiates `SignalServer`, wires `arb.on_cross_` lambda, adds `signal_server->stop()` to shutdown handler | ✅ Done |
+
+55/55 tests passing. Brain target builds clean.
 
 ---
 

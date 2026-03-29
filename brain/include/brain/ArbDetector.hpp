@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <atomic>
 #include <cstdint>
 #include <fstream>
@@ -72,6 +73,21 @@ public:
     [[nodiscard]] LatencyHistogram::Percentiles latency_percentiles() const {
         return latency_hist_.compute();
     }
+
+    /// ES1: optional callback invoked for every cross that passes all guards and emission
+    /// checks (active_ flag, rate limit, spread bounds). Fires inside emit_() after the
+    /// spdlog line and before the JSONL write, so the caller receives only validated signals.
+    ///
+    /// Set by brain.cpp after construction to forward signals to SignalServer:
+    /// @code
+    ///   arb.on_cross_ = [&signal_server](const ArbCross &c) {
+    ///       signal_server.broadcast(serialize_cross(c));
+    ///   };
+    /// @endcode
+    ///
+    /// Default-constructed (empty) — behaviour is identical to pre-ES1 when unset.
+    /// Must not throw; exceptions propagate to the brain I/O scan thread.
+    std::function<void(const ArbCross &)> on_cross_;
 
 private:
     static std::int64_t now_ns_() noexcept;
