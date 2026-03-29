@@ -13,7 +13,7 @@ Execution layer MVP: signal broadcast from brain + exec process with pluggable s
 | ES1 | `ArbDetector::on_cross_` callback hook (2 lines) | ✅ Done |
 | ES2 | `SignalServer` outbound WS push in brain | ✅ Done |
 | ES3 | Brain wiring: `BrainCmdLine` signal flags + `brain.cpp` callback | ✅ Done |
-| EX1 | `exec/` subproject scaffold + CMakeLists | ⬜ Not Started |
+| EX1 | `exec/` subproject scaffold + CMakeLists | ✅ Done |
 | EX2 | `IOrderClient` interface + `StubOrderClient` | ⬜ Not Started |
 | EX3 | `IExecStrategy` interface + `ImmediateStrategy` (MVP strategy) | ⬜ Not Started |
 | EX4 | `ExecEngine` with E1–E4 guards | ⬜ Not Started |
@@ -110,7 +110,7 @@ Full design in `docs/EXECUTION_LAYER_PLAN.md`.
 
 | # | Item | Priority | Status | Files | Notes |
 |---|---|---|---|---|---|
-| EX1 | `exec` subproject scaffold: `exec/CMakeLists.txt`; links `common_core`; `add_subdirectory(exec)` in root | HIGH | ⬜ Not Started | `exec/CMakeLists.txt`, `CMakeLists.txt` | |
+| EX1 | `exec` subproject scaffold: `exec/CMakeLists.txt`; links `common_core` + `brain_core`; `add_subdirectory(exec)` in root | HIGH | ✅ Done | `exec/CMakeLists.txt`, `CMakeLists.txt` | |
 | EX2 | `IOrderClient` pure interface: `Order`/`Fill` structs, `submit_order()`, `cancel_order()` callbacks; `StubOrderClient` logs + fires immediate synthetic fill | HIGH | ⬜ Not Started | `exec/include/exec/IOrderClient.hpp`, `exec/include/exec/StubOrderClient.hpp` | |
 | EX3 | `IExecStrategy` pure interface: `on_signal(ArbCross)`, `pause()`, `resume()`; constructed with `IOrderClient&`, `OrderTracker&`, Asio strand; `ImmediateStrategy` (single market order, level-0 qty) as first implementation | HIGH | ⬜ Not Started | `exec/include/exec/IExecStrategy.hpp`, `exec/include/exec/ImmediateStrategy.hpp` | New strategies only need to implement this interface |
 | EX4 | `ExecEngine`: E1 position limit, E2 kill switch (SIGUSR1), E3 signal dedup/cooldown, E4 fat-finger notional cap; calls `strategy_->on_signal()` after all guards pass | HIGH | ⬜ Not Started | `exec/include/exec/ExecEngine.hpp`, `exec/src/exec/ExecEngine.cpp` | |
