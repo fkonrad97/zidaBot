@@ -26,6 +26,7 @@ struct BrainOptions {
     std::size_t depth{50};      ///< OrderBook depth per venue
     uint16_t    health_port{0};   ///< D5: plain-HTTP health endpoint port (0 = disabled)
     bool        standby{false};   ///< F4: start in passive standby mode (no signal emission)
+    uint16_t signal_port{0};  ///< ES2: outbound exec signal port (0 = disabled)
     bool        show_help{false};
 };
 
@@ -71,7 +72,9 @@ inline bool parse_brain_cmdline(int argc, char **argv, BrainOptions &out) {
                           "D5: plain-HTTP health endpoint port (0 = disabled); e.g. 8081")
         ("standby",       po::bool_switch()->default_value(false),
                           "F4: start in passive standby mode — receives data but emits no signals; "
-                          "promote to active with SIGUSR1");
+                          "promote to active with SIGUSR1")
+        ("signal-port",   po::value<uint16_t>()->default_value(0),
+                          "ES2: outbound WebSocket port for exec signal push (0 = disabled)");
 
     po::variables_map vm;
     try {
@@ -114,6 +117,7 @@ inline bool parse_brain_cmdline(int argc, char **argv, BrainOptions &out) {
     out.log_level = vm["log-level"].as<std::string>();
     out.health_port = vm["health-port"].as<uint16_t>();
     out.standby     = vm["standby"].as<bool>();
+    out.signal_port = vm["signal-port"].as<uint16_t>();
     if (vm.count("certfile"))   out.certfile   = vm["certfile"].as<std::string>();
     if (vm.count("keyfile"))    out.keyfile    = vm["keyfile"].as<std::string>();
     if (vm.count("ca-certfile")) out.ca_certfile = vm["ca-certfile"].as<std::string>();

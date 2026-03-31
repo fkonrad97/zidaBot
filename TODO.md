@@ -10,17 +10,61 @@ Execution layer MVP: signal broadcast from brain + exec process with pluggable s
 
 | # | Item | Status |
 |---|---|---|
-| ES1 | `ArbDetector::on_cross_` callback hook (2 lines) | ⬜ Not Started |
-| ES2 | `SignalServer` outbound WS push in brain | ⬜ Not Started |
-| ES3 | Brain wiring: `BrainCmdLine` signal flags + `brain.cpp` callback | ⬜ Not Started |
-| EX1 | `exec/` subproject scaffold + CMakeLists | ⬜ Not Started |
-| EX2 | `IOrderClient` interface + `StubOrderClient` | ⬜ Not Started |
-| EX3 | `IExecStrategy` interface + `ImmediateStrategy` (MVP strategy) | ⬜ Not Started |
-| EX4 | `ExecEngine` with E1–E4 guards | ⬜ Not Started |
-| EX5 | `OrderTracker` E5 confirmation timeout + hedge | ⬜ Not Started |
-| EX6 | `ExecCmdLine` + `exec.cpp` main | ⬜ Not Started |
+| ES1 | `ArbDetector::on_cross_` callback hook (2 lines) | ✅ Done |
+| ES2 | `SignalServer` outbound WS push in brain | ✅ Done |
+| ES3 | Brain wiring: `BrainCmdLine` signal flags + `brain.cpp` callback | ✅ Done |
+| EX1 | `exec/` subproject scaffold + CMakeLists | ✅ Done |
+| EX2 | `IOrderClient` interface + `StubOrderClient` | ✅ Done |
+| EX3 | `IExecStrategy` interface + `ImmediateStrategy` (MVP strategy) | ✅ Done |
+| EX4 | `ExecEngine` with E1–E4 guards | ✅ Done |
+| EX5 | `OrderTracker` E5 confirmation timeout + hedge | ✅ Done |
+| EX6 | `ExecCmdLine` + `exec.cpp` main | ✅ Done |
 
 Post-MVP strategies (`ThresholdStrategy`, `SliceStrategy`) tracked as EE1/EE2 in Track E.
+
+---
+
+## Bugs & Quick Fixes — ✅ From Code Review (2026-03-30)
+
+Issues found during code review of `feature/exec-layer`. All items fixed 2026-03-31.
+
+### CRITICAL — Thread Safety
+
+| # | Item | Priority | Status | Files |
+|---|---|---|---|---|
+| CRIT-1 | `SignalServer::sessions_` data race — `broadcast()` runs on scan thread while `on_accept_()` mutates on I/O pool threads; add a server-level `net::strand` and post all `sessions_` access onto it | CRITICAL | ✅ Done | `brain/src/brain/SignalServer.cpp`, `brain/include/brain/SignalServer.hpp` |
+| CRIT-2 | `SignalSession::close()` touches raw TCP socket outside session strand while async ops are in flight — dispatch close onto session's strand via `net::post` | CRITICAL | ✅ Done | `brain/src/brain/SignalServer.cpp` |
+
+### HIGH
+
+| # | Item | Priority | Status | Files |
+|---|---|---|---|---|
+| HIGH-1 | `broadcast()` blocks scan thread while iterating sessions — after CRIT-1 fix, ensure snapshot copy is taken under lock and `send()` called outside lock | HIGH | ✅ Done | `brain/src/brain/SignalServer.cpp` |
+| HIGH-2 | `ImmediateStrategy::strand_` stored as dangling reference; `order_seq_` not atomic — store strand by value, use `std::atomic<uint64_t>` | HIGH | ✅ Done | `exec/include/exec/ImmediateStrategy.hpp` |
+| HIGH-3 | `StubOrderClient::submit_order` fires callback synchronously — post callback onto strand to match async contract | HIGH | ✅ Done | `exec/include/exec/StubOrderClient.hpp` |
+| HIGH-4 | `SignalServer::stopped_` plain `bool` read/written across threads — change to `std::atomic<bool>` | HIGH | ✅ Done | `brain/include/brain/SignalServer.hpp`, `brain/src/brain/SignalServer.cpp` |
+
+### MEDIUM
+
+| # | Item | Priority | Status | Files |
+|---|---|---|---|---|
+| MED-1 | Hot-path `std::string` heap alloc per venue pair in scan inner loop — pre-allocate and reuse buffer | MEDIUM | ✅ Done | `brain/src/brain/ArbDetector.cpp` |
+| MED-2 | Synchronous `j.dump()` + file I/O in `emit_()` on scan thread — defer to background writer thread | MEDIUM | ✅ Done | `brain/src/brain/ArbDetector.cpp`, `brain/include/brain/ArbDetector.hpp` |
+| MED-3 | No `read_message_max` on `SignalSession` — add `ws_.read_message_max(65536)` in `do_ws_accept_()` | MEDIUM | ✅ Done | `brain/src/brain/SignalServer.cpp` |
+| MED-4 | `on_cross_` assigned after scan thread starts — move assignment before scan thread construction | MEDIUM | ✅ Done | `brain/app/brain.cpp` |
+| MED-5 | `SignalServer` lacks server-level strand (root cause of CRIT-1) — add `net::strand strand_` member, bind `do_accept_` and `on_accept_` to it | MEDIUM | ✅ Done | `brain/src/brain/SignalServer.cpp`, `brain/include/brain/SignalServer.hpp` |
+| MED-6 | Per-tick heap alloc for `price_anomaly`/`bids` vectors in `scan()` — use `std::array<T, kMaxVenues>` members | MEDIUM | ✅ Done | `brain/src/brain/ArbDetector.cpp`, `brain/include/brain/ArbDetector.hpp` |
+| MED-7 | Arb signal JSONL missing `schema_version` + `event_type` fields — add to `emit_()` and `serialize_cross()` | MEDIUM | ✅ Done | `brain/src/brain/ArbDetector.cpp`, `brain/app/brain.cpp` |
+
+### LOW
+
+| # | Item | Priority | Status | Files |
+|---|---|---|---|---|
+| LOW-1 | `do_accept_` captures `this` raw — use `shared_from_this` | LOW | ✅ Done | `brain/src/brain/SignalServer.cpp`, `brain/include/brain/SignalServer.hpp` |
+| LOW-2 | `pause()`/`resume()` silent no-ops could pass orders through after kill-switch — consider pure virtual or add `is_paused()` guard in engine | LOW | ✅ Done | `exec/include/exec/IExecStrategy.hpp`, `exec/include/exec/ImmediateStrategy.hpp` |
+| LOW-3 | `exec.cpp` + `placeholder.cpp` are scaffolding stubs — remove before merge | LOW | ✅ Done | `exec/app/exec.cpp`, `exec/src/exec/placeholder.cpp` |
+| LOW-4 | `ArbDetector::flush()` marked `noexcept` but spdlog can throw — wrap body in `try/catch(...)` | LOW | ✅ Done | `brain/include/brain/ArbDetector.hpp` |
+| LOW-5 | Premature semicolon in `BrainCmdLine.hpp` options chain breaks readability | LOW | ✅ Done | `brain/include/brain/BrainCmdLine.hpp` |
 
 ---
 
@@ -102,20 +146,20 @@ Full design in `docs/EXECUTION_LAYER_PLAN.md`.
 
 | # | Item | Priority | Status | Files | Notes |
 |---|---|---|---|---|---|
-| ES1 | `ArbDetector::on_cross_` callback hook: `std::function<void(const ArbCross &)>` member; invoked in `emit_()` after file write | HIGH | ⬜ Not Started | `brain/include/brain/ArbDetector.hpp`, `brain/src/brain/ArbDetector.cpp` | 2-line change; unblocks all downstream work |
-| ES2 | `SignalServer`: outbound-only Boost.Beast WS server; `broadcast(text)` pushes ArbCross JSON to all connected exec clients; session outbox + strand; mTLS optional; max 10 subscribers | HIGH | ⬜ Not Started | `brain/include/brain/SignalServer.hpp`, `brain/src/brain/SignalServer.cpp` | Pattern: `WsServer`/`WsSession` |
-| ES3 | Wire `SignalServer` in brain: `BrainCmdLine` adds `--signal-port`, `--signal-certfile/keyfile/ca-certfile`; `brain.cpp` instantiates `SignalServer`, sets `arb.on_cross_` to `signal_server.broadcast(...)` | HIGH | ⬜ Not Started | `brain/include/brain/BrainCmdLine.hpp`, `brain/app/brain.cpp` | |
+| ES1 | `ArbDetector::on_cross_` callback hook: `std::function<void(const ArbCross &)>` member; invoked in `emit_()` after file write | HIGH | ✅ Done | `brain/include/brain/ArbDetector.hpp`, `brain/src/brain/ArbDetector.cpp` | 2-line change; unblocks all downstream work |
+| ES2 | `SignalServer`: outbound-only Boost.Beast WS server; `broadcast(text)` pushes ArbCross JSON to all connected exec clients; session outbox + strand; mTLS optional; max 10 subscribers | HIGH | ✅ Done | `brain/include/brain/SignalServer.hpp`, `brain/src/brain/SignalServer.cpp` | Pattern: `WsServer`/`WsSession` |
+| ES3 | Wire `SignalServer` in brain: `BrainCmdLine` adds `--signal-port`, `--signal-certfile/keyfile/ca-certfile`; `brain.cpp` instantiates `SignalServer`, sets `arb.on_cross_` to `signal_server.broadcast(...)` | HIGH | ✅ Done | `brain/include/brain/BrainCmdLine.hpp`, `brain/app/brain.cpp` | |
 
 ### E — Exec Process (venue side)
 
 | # | Item | Priority | Status | Files | Notes |
 |---|---|---|---|---|---|
-| EX1 | `exec` subproject scaffold: `exec/CMakeLists.txt`; links `common_core`; `add_subdirectory(exec)` in root | HIGH | ⬜ Not Started | `exec/CMakeLists.txt`, `CMakeLists.txt` | |
-| EX2 | `IOrderClient` pure interface: `Order`/`Fill` structs, `submit_order()`, `cancel_order()` callbacks; `StubOrderClient` logs + fires immediate synthetic fill | HIGH | ⬜ Not Started | `exec/include/exec/IOrderClient.hpp`, `exec/include/exec/StubOrderClient.hpp` | |
-| EX3 | `IExecStrategy` pure interface: `on_signal(ArbCross)`, `pause()`, `resume()`; constructed with `IOrderClient&`, `OrderTracker&`, Asio strand; `ImmediateStrategy` (single market order, level-0 qty) as first implementation | HIGH | ⬜ Not Started | `exec/include/exec/IExecStrategy.hpp`, `exec/include/exec/ImmediateStrategy.hpp` | New strategies only need to implement this interface |
-| EX4 | `ExecEngine`: E1 position limit, E2 kill switch (SIGUSR1), E3 signal dedup/cooldown, E4 fat-finger notional cap; calls `strategy_->on_signal()` after all guards pass | HIGH | ⬜ Not Started | `exec/include/exec/ExecEngine.hpp`, `exec/src/exec/ExecEngine.cpp` | |
-| EX5 | `OrderTracker` (E5): Asio steady_timer per pending order; on expiry logs TIMEOUT and submits opposing hedge via `IOrderClient` | MEDIUM | ⬜ Not Started | `exec/include/exec/OrderTracker.hpp`, `exec/src/exec/OrderTracker.cpp` | |
-| EX6 | `ExecCmdLine` + `exec.cpp` main: connects to brain `SignalServer` via `WsClient`; parses `--venue`, `--brain-signal-host/port`, guard params, `--strategy`; strategy factory selects `ImmediateStrategy` | HIGH | ⬜ Not Started | `exec/include/exec/ExecCmdLine.hpp`, `exec/app/exec.cpp` | |
+| EX1 | `exec` subproject scaffold: `exec/CMakeLists.txt`; links `common_core` + `brain_core`; `add_subdirectory(exec)` in root | HIGH | ✅ Done | `exec/CMakeLists.txt`, `CMakeLists.txt` | |
+| EX2 | `IOrderClient` pure interface: `Order`/`Fill` structs, `submit_order()`, `cancel_order()` callbacks; `StubOrderClient` logs + fires immediate synthetic fill | HIGH | ✅ Done | `exec/include/exec/IOrderClient.hpp`, `exec/include/exec/StubOrderClient.hpp` | |
+| EX3 | `IExecStrategy` pure interface: `on_signal(ArbCross)`, `pause()`, `resume()`; constructed with `IOrderClient&`, `OrderTracker&`, Asio strand; `ImmediateStrategy` (single market order, level-0 qty) as first implementation | HIGH | ✅ Done | `exec/include/exec/IExecStrategy.hpp`, `exec/include/exec/ImmediateStrategy.hpp` | New strategies only need to implement this interface |
+| EX4 | `ExecEngine`: E1 position limit, E2 kill switch (SIGUSR1), E3 signal dedup/cooldown, E4 fat-finger notional cap; calls `strategy_->on_signal()` after all guards pass | HIGH | ✅ Done | `exec/include/exec/ExecEngine.hpp`, `exec/src/exec/ExecEngine.cpp` | |
+| EX5 | `DeadlineOrderTracker` (E5): Asio `steady_timer` per pending order; on expiry logs TIMEOUT and calls `on_timeout_` callback; `cancel_all()` for clean shutdown | MEDIUM | ✅ Done | `exec/include/exec/OrderTracker.hpp`, `exec/include/exec/DeadlineOrderTracker.hpp`, `exec/src/exec/DeadlineOrderTracker.cpp` | |
+| EX6 | `ExecCmdLine` + `exec.cpp` main: connects to brain `SignalServer` via `WsClient`; dispatches `ArbCross` onto exec strand; assembles `StubOrderClient` → `DeadlineOrderTracker` → `ImmediateStrategy` → `ExecEngine` | HIGH | ✅ Done | `exec/include/exec/ExecCmdLine.hpp`, `exec/app/exec.cpp` | |
 
 ### E — Extended Strategies (post-MVP)
 
@@ -163,6 +207,10 @@ serialised as JSON text frames, which is human-readable but CPU-heavy on both en
 | # | Item | Priority | Status | Notes |
 |---|---|---|---|---|
 | H1 | Binary wire format between PoP and Brain: replace `nlohmann::json` serialisation/deserialisation with MessagePack (drop-in, same schema), FlatBuffers (zero-copy, requires schema), or a custom fixed binary layout. Biggest win is on the brain parse side (hot path, single thread). | MEDIUM | ✅ Done | `nlohmann::json::to_msgpack()` / `from_msgpack()` — zero new deps; WS binary frames; backward-compat text-JSON fallback in brain; `send_binary()` added to `WsClient` |
+| H2 | Replace `nlohmann/json` in PoP exchange feed parsing (hot path — every tick) with simdjson or RapidJSON. nlohmann builds a full DOM with heap allocation per parse; simdjson parses in-place via SIMD with zero allocation. Profile PoP parse time first to quantify the win. | MEDIUM | ⬜ Not Started | Priority order: PoP feed (hottest) → brain ingestion → signal channel |
+| H3 | Replace `nlohmann::from_msgpack()` in brain PoP feed ingestion with a purpose-built msgpack library (mpack or msgpack-c) for zero-copy reads. Currently every incoming PoP frame allocates via nlohmann DOM. | LOW | ⬜ Not Started | Depends on H2 profiling results to confirm this is the next bottleneck |
+| H4 | Replace `nlohmann/json` on the brain→exec signal channel with a fixed-size binary struct or MessagePack. Current JSON is ~200 bytes/signal; binary could reduce to ~64 bytes with zero-allocation parsing on exec side. | LOW | ⬜ Not Started | Revisit after ES1–EX6 (exec layer) complete; signal channel does not exist yet |
+| H5 | Evaluate moving `WsServer`/`WsSession` and `SignalServer`/`SignalSession` into `common/` if a second process ever needs to accept connections. Currently brain-only so they stay in `brain/`; revisit if exec or a future venue-side server needs an acceptor. | LOW | ⬜ Not Started | No action needed until a second acceptor user exists |
 
 ---
 
@@ -261,6 +309,36 @@ library regardless of `-fPIC`. Replaced with a subprocess binary approach.
 | I1 | `brain/include/brain/BacktestEngine.hpp` + `brain/src/brain/BacktestEngine.cpp` | ✅ Done |
 | I2 | `brain/app/zidabot_replay.cpp` subprocess binary (stdin JSONL → stdout JSON crosses) | ✅ Done |
 | I3 | `python/example_backtest.py` subprocess-based replay helper + `docs/HOWTO.md` §13 | ✅ Done |
+
+---
+
+## Batch 13B — ✅ Complete (2026-03-31)
+
+Exec-process execution layer: IOrderClient, IExecStrategy, ExecEngine (E1–E4 guards), DeadlineOrderTracker (E5), and exec.cpp main entry point.
+
+| # | Item | Status |
+|---|---|---|
+| EX2 | `IOrderClient` + `StubOrderClient`: async fill callback contract; stub posts synthetic fill onto exec strand | ✅ Done |
+| EX3 | `IExecStrategy` + `ImmediateStrategy`: single market order per leg; `paused_` atomic; `OrderTracker` abstract interface stub | ✅ Done |
+| EX4 | `ExecEngine`: E4 (fat-finger) → E1 (position limit) → E2 (kill switch) → E3 (dedup cooldown) → `strategy_->on_signal()` | ✅ Done |
+| EX5 | `DeadlineOrderTracker`: `enable_shared_from_this`; `steady_timer` per order; `cancel()` on fill; `cancel_all()` for shutdown | ✅ Done |
+| EX6 | `ExecCmdLine` + `exec.cpp`: `WsClient` → exec strand dispatch → `ExecEngine`; `SIGINT/SIGTERM` graceful shutdown | ✅ Done |
+
+60/60 tests passing. `exec` binary builds clean. Full E-track wired end-to-end.
+
+---
+
+## Batch 13A — ✅ Complete (2026-03-29)
+
+Brain-side execution layer: ArbDetector callback hook + SignalServer outbound WS push + brain.cpp wiring.
+
+| # | Item | Status |
+|---|---|---|
+| ES1 | `ArbDetector::on_cross_` callback: `std::function<void(const ArbCross &)>` member; invoked in `emit_()` after all guards pass | ✅ Done |
+| ES2 | `SignalServer` + `SignalSession`: outbound-only TLS WS server; per-session outbox (kMaxOutbox=64, drop-oldest); `broadcast()` safe from any thread via `net::post()` | ✅ Done |
+| ES3 | `BrainCmdLine` adds `--signal-port`; `brain.cpp` adds `serialize_cross()`, instantiates `SignalServer`, wires `arb.on_cross_` lambda, adds `signal_server->stop()` to shutdown handler | ✅ Done |
+
+55/55 tests passing. Brain target builds clean.
 
 ---
 

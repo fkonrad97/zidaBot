@@ -93,8 +93,9 @@ FetchContent_MakeAvailable(spdlog)
 
 # ---- Subprojects ----
 add_subdirectory(common)
-add_subdirectory(pop)
+add_subdirectory(feed)
 add_subdirectory(brain)
+add_subdirectory(exec)
 
 # ---- Tests ----
 option(BUILD_TESTS "Build unit tests" ON)

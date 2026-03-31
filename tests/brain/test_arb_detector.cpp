@@ -192,3 +192,78 @@ TEST(ArbDetector, LastCrossNsUpdatedAfterActiveEmit) {
     det.scan(venues);
     EXPECT_GT(det.last_cross_ns(), 0);
 }
+
+// ── ES1: on_cross_ callback ───────────────────────────────────────────────────
+TEST(ArbDetector, OnCrossCallbackFiredForValidCross) {
+    auto det = make_detector();
+    int fired = 0;
+    det.on_cross_ = [&fired](const brain::ArbCross &) { ++fired; };
+    const std::int64_t ts = now_ns();
+    std::vector<VenueBook> venues;
+    venues.push_back(make_synced("a", 10100, 10200, ts));
+    venues.push_back(make_synced("b", 10000,  9900, ts));
+    det.scan(venues);
+    EXPECT_EQ(fired, 1);
+}
+
+TEST(ArbDetector, OnCrossCallbackNotFiredWhenNoCross) {
+    auto det = make_detector();
+    int fired = 0;
+    det.on_cross_ = [&fired](const brain::ArbCross &) { ++fired; };
+    const std::int64_t ts = now_ns();
+    std::vector<VenueBook> venues;
+    venues.push_back(make_synced("a", 10000, 10100, ts));
+    venues.push_back(make_synced("b", 10050, 10200, ts));
+    det.scan(venues);
+    EXPECT_EQ(fired, 0);
+}
+
+TEST(ArbDetector, OnCrossCallbackNotFiredInStandbyMode) {
+    ArbDetector det(0.1, 0.0, 0, 0, 0.0, "");
+    det.set_active(false);
+    int fired = 0;
+    det.on_cross_ = [&fired](const brain::ArbCross &) { ++fired; };
+    const std::int64_t ts = now_ns();
+    std::vector<VenueBook> venues;
+    venues.push_back(make_synced("a", 10100, 10200, ts));
+    venues.push_back(make_synced("b", 10000,  9900, ts));
+    det.scan(venues);
+    // scan() returns the cross but emit_() is suppressed in standby → callback must not fire
+    EXPECT_EQ(fired, 0);
+}
+
+TEST(ArbDetector, OnCrossCallbackReceivesCorrectCrossFields) {
+    auto det = make_detector();
+    brain::ArbCross captured{};
+    det.on_cross_ = [&captured](const brain::ArbCross &c) { captured = c; };
+    const std::int64_t ts = now_ns();
+    std::vector<VenueBook> venues;
+    venues.push_back(make_synced("sell_v", 10100, 10200, ts));
+    venues.push_back(make_synced("buy_v",  10000,  9900, ts));
+    det.scan(venues);
+    EXPECT_EQ(captured.sell_venue, "sell_v");
+    EXPECT_EQ(captured.buy_venue,  "buy_v");
+    EXPECT_EQ(captured.sell_bid_tick, 10100);
+    EXPECT_EQ(captured.buy_ask_tick,   9900);
+    EXPECT_GT(captured.spread_bps, 0.0);
+    EXPECT_GT(captured.ts_detected_ns, 0);
+}
+
+TEST(ArbDetector, OnCrossCallbackSuppressedByRateLimit) {
+    // rate limit of 1000 seconds → only first scan emits
+    ArbDetector det(0.1, 0.0, 1'000'000'000'000LL, 0, 0.0, "");
+    int fired = 0;
+    det.on_cross_ = [&fired](const brain::ArbCross &) { ++fired; };
+    const std::int64_t ts = now_ns();
+
+    auto make_v = [&]() {
+        std::vector<VenueBook> v;
+        v.push_back(make_synced("a", 10100, 10200, ts));
+        v.push_back(make_synced("b", 10000,  9900, ts));
+        return v;
+    };
+
+    det.scan(make_v());
+    det.scan(make_v());
+    EXPECT_EQ(fired, 1); // second emission suppressed by rate limit
+}
