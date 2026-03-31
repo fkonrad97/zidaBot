@@ -96,6 +96,10 @@ namespace brain
                     sp->close();
             }
             self->sessions_.clear();
+<<<<<<< HEAD
+=======
+            self->live_count_.store(0, std::memory_order_relaxed);
+>>>>>>> 37e2fba (Refactor exec process and implement order tracking)
         });
     }
 
@@ -108,11 +112,21 @@ namespace brain
         net::dispatch(strand_, [self = shared_from_this(), text = std::move(text)]() mutable
         {
             // Prune expired weak_ptrs — runs on strand_ so sessions_ access is safe.
+<<<<<<< HEAD
+=======
+            const std::size_t before = self->sessions_.size();
+>>>>>>> 37e2fba (Refactor exec process and implement order tracking)
             self->sessions_.erase(
                 std::remove_if(self->sessions_.begin(), self->sessions_.end(),
                                [](const std::weak_ptr<SignalSession> &w)
                                { return w.expired(); }),
                 self->sessions_.end());
+<<<<<<< HEAD
+=======
+            const std::size_t pruned = before - self->sessions_.size();
+            if (pruned > 0)
+                self->live_count_.fetch_sub(pruned, std::memory_order_relaxed);
+>>>>>>> 37e2fba (Refactor exec process and implement order tracking)
 
             // Take a snapshot of live shared_ptrs, then send outside the strand
             // so a slow session cannot block others.
@@ -129,6 +143,7 @@ namespace brain
         });
     }
 
+<<<<<<< HEAD
     // Counts non-expired weak_ptrs without touching session internals.
     // Used by brain's health endpoint to report connected exec clients.
     // Note: called from the I/O thread; safe because sessions_ is only mutated
@@ -140,6 +155,8 @@ namespace brain
                           [](const std::weak_ptr<SignalSession> &w)
                           { return !w.expired(); }));
     }
+=======
+>>>>>>> 37e2fba (Refactor exec process and implement order tracking)
 
     // Arms a single async_accept. The accepted socket gets its own strand
     // (net::make_strand(ioc_)) which becomes the SignalSession's executor —
@@ -191,11 +208,22 @@ namespace brain
         // Give the session socket its own per-session strand, distinct from the
         // server-level strand_. This serialises all session async ops independently
         // so a slow session never blocks others or the accept loop.
+<<<<<<< HEAD
         auto session = SignalSession::create(
             tcp::socket(net::make_strand(ioc_), socket.local_endpoint().protocol(),
                         socket.release()),
+=======
+        // proto and fd are extracted first to avoid undefined argument evaluation order
+        // when both socket.local_endpoint().protocol() and socket.release() appear
+        // in the same constructor call expression.
+        const auto proto = socket.local_endpoint().protocol();
+        const auto fd    = socket.release();
+        auto session = SignalSession::create(
+            tcp::socket(net::make_strand(ioc_), proto, fd),
+>>>>>>> 37e2fba (Refactor exec process and implement order tracking)
             ssl_ctx_);
         sessions_.emplace_back(session);
+        live_count_.fetch_add(1, std::memory_order_relaxed);
         session->run();
 
         // Re-arm immediately so the next exec client can connect without delay.

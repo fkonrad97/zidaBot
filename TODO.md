@@ -14,11 +14,11 @@ Execution layer MVP: signal broadcast from brain + exec process with pluggable s
 | ES2 | `SignalServer` outbound WS push in brain | ✅ Done |
 | ES3 | Brain wiring: `BrainCmdLine` signal flags + `brain.cpp` callback | ✅ Done |
 | EX1 | `exec/` subproject scaffold + CMakeLists | ✅ Done |
-| EX2 | `IOrderClient` interface + `StubOrderClient` | ⬜ Not Started |
-| EX3 | `IExecStrategy` interface + `ImmediateStrategy` (MVP strategy) | ⬜ Not Started |
-| EX4 | `ExecEngine` with E1–E4 guards | ⬜ Not Started |
-| EX5 | `OrderTracker` E5 confirmation timeout + hedge | ⬜ Not Started |
-| EX6 | `ExecCmdLine` + `exec.cpp` main | ⬜ Not Started |
+| EX2 | `IOrderClient` interface + `StubOrderClient` | ✅ Done |
+| EX3 | `IExecStrategy` interface + `ImmediateStrategy` (MVP strategy) | ✅ Done |
+| EX4 | `ExecEngine` with E1–E4 guards | ✅ Done |
+| EX5 | `OrderTracker` E5 confirmation timeout + hedge | ✅ Done |
+| EX6 | `ExecCmdLine` + `exec.cpp` main | ✅ Done |
 
 Post-MVP strategies (`ThresholdStrategy`, `SliceStrategy`) tracked as EE1/EE2 in Track E.
 
@@ -155,11 +155,11 @@ Full design in `docs/EXECUTION_LAYER_PLAN.md`.
 | # | Item | Priority | Status | Files | Notes |
 |---|---|---|---|---|---|
 | EX1 | `exec` subproject scaffold: `exec/CMakeLists.txt`; links `common_core` + `brain_core`; `add_subdirectory(exec)` in root | HIGH | ✅ Done | `exec/CMakeLists.txt`, `CMakeLists.txt` | |
-| EX2 | `IOrderClient` pure interface: `Order`/`Fill` structs, `submit_order()`, `cancel_order()` callbacks; `StubOrderClient` logs + fires immediate synthetic fill | HIGH | ⬜ Not Started | `exec/include/exec/IOrderClient.hpp`, `exec/include/exec/StubOrderClient.hpp` | |
-| EX3 | `IExecStrategy` pure interface: `on_signal(ArbCross)`, `pause()`, `resume()`; constructed with `IOrderClient&`, `OrderTracker&`, Asio strand; `ImmediateStrategy` (single market order, level-0 qty) as first implementation | HIGH | ⬜ Not Started | `exec/include/exec/IExecStrategy.hpp`, `exec/include/exec/ImmediateStrategy.hpp` | New strategies only need to implement this interface |
-| EX4 | `ExecEngine`: E1 position limit, E2 kill switch (SIGUSR1), E3 signal dedup/cooldown, E4 fat-finger notional cap; calls `strategy_->on_signal()` after all guards pass | HIGH | ⬜ Not Started | `exec/include/exec/ExecEngine.hpp`, `exec/src/exec/ExecEngine.cpp` | |
-| EX5 | `OrderTracker` (E5): Asio steady_timer per pending order; on expiry logs TIMEOUT and submits opposing hedge via `IOrderClient` | MEDIUM | ⬜ Not Started | `exec/include/exec/OrderTracker.hpp`, `exec/src/exec/OrderTracker.cpp` | |
-| EX6 | `ExecCmdLine` + `exec.cpp` main: connects to brain `SignalServer` via `WsClient`; parses `--venue`, `--brain-signal-host/port`, guard params, `--strategy`; strategy factory selects `ImmediateStrategy` | HIGH | ⬜ Not Started | `exec/include/exec/ExecCmdLine.hpp`, `exec/app/exec.cpp` | |
+| EX2 | `IOrderClient` pure interface: `Order`/`Fill` structs, `submit_order()`, `cancel_order()` callbacks; `StubOrderClient` logs + fires immediate synthetic fill | HIGH | ✅ Done | `exec/include/exec/IOrderClient.hpp`, `exec/include/exec/StubOrderClient.hpp` | |
+| EX3 | `IExecStrategy` pure interface: `on_signal(ArbCross)`, `pause()`, `resume()`; constructed with `IOrderClient&`, `OrderTracker&`, Asio strand; `ImmediateStrategy` (single market order, level-0 qty) as first implementation | HIGH | ✅ Done | `exec/include/exec/IExecStrategy.hpp`, `exec/include/exec/ImmediateStrategy.hpp` | New strategies only need to implement this interface |
+| EX4 | `ExecEngine`: E1 position limit, E2 kill switch (SIGUSR1), E3 signal dedup/cooldown, E4 fat-finger notional cap; calls `strategy_->on_signal()` after all guards pass | HIGH | ✅ Done | `exec/include/exec/ExecEngine.hpp`, `exec/src/exec/ExecEngine.cpp` | |
+| EX5 | `DeadlineOrderTracker` (E5): Asio `steady_timer` per pending order; on expiry logs TIMEOUT and calls `on_timeout_` callback; `cancel_all()` for clean shutdown | MEDIUM | ✅ Done | `exec/include/exec/OrderTracker.hpp`, `exec/include/exec/DeadlineOrderTracker.hpp`, `exec/src/exec/DeadlineOrderTracker.cpp` | |
+| EX6 | `ExecCmdLine` + `exec.cpp` main: connects to brain `SignalServer` via `WsClient`; dispatches `ArbCross` onto exec strand; assembles `StubOrderClient` → `DeadlineOrderTracker` → `ImmediateStrategy` → `ExecEngine` | HIGH | ✅ Done | `exec/include/exec/ExecCmdLine.hpp`, `exec/app/exec.cpp` | |
 
 ### E — Extended Strategies (post-MVP)
 
@@ -309,6 +309,22 @@ library regardless of `-fPIC`. Replaced with a subprocess binary approach.
 | I1 | `brain/include/brain/BacktestEngine.hpp` + `brain/src/brain/BacktestEngine.cpp` | ✅ Done |
 | I2 | `brain/app/zidabot_replay.cpp` subprocess binary (stdin JSONL → stdout JSON crosses) | ✅ Done |
 | I3 | `python/example_backtest.py` subprocess-based replay helper + `docs/HOWTO.md` §13 | ✅ Done |
+
+---
+
+## Batch 13B — ✅ Complete (2026-03-31)
+
+Exec-process execution layer: IOrderClient, IExecStrategy, ExecEngine (E1–E4 guards), DeadlineOrderTracker (E5), and exec.cpp main entry point.
+
+| # | Item | Status |
+|---|---|---|
+| EX2 | `IOrderClient` + `StubOrderClient`: async fill callback contract; stub posts synthetic fill onto exec strand | ✅ Done |
+| EX3 | `IExecStrategy` + `ImmediateStrategy`: single market order per leg; `paused_` atomic; `OrderTracker` abstract interface stub | ✅ Done |
+| EX4 | `ExecEngine`: E4 (fat-finger) → E1 (position limit) → E2 (kill switch) → E3 (dedup cooldown) → `strategy_->on_signal()` | ✅ Done |
+| EX5 | `DeadlineOrderTracker`: `enable_shared_from_this`; `steady_timer` per order; `cancel()` on fill; `cancel_all()` for shutdown | ✅ Done |
+| EX6 | `ExecCmdLine` + `exec.cpp`: `WsClient` → exec strand dispatch → `ExecEngine`; `SIGINT/SIGTERM` graceful shutdown | ✅ Done |
+
+60/60 tests passing. `exec` binary builds clean. Full E-track wired end-to-end.
 
 ---
 

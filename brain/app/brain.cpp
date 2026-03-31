@@ -400,7 +400,9 @@ int main(int argc, char **argv)
     // G4: wait for scan thread to drain and exit.
     if (scan_thread.joinable())
         scan_thread.join();
-    arb.flush();
+    // arb.flush() is not called here — ArbDetector destructor calls flush()
+    // via ~ArbDetector() → flush(). Calling it twice would double-log stats
+    // and risks closing the output file before the writer thread fully drains.
     md::log::flush();
     return 0;
 }

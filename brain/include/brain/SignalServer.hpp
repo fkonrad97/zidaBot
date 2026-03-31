@@ -41,8 +41,11 @@ namespace brain
         /// Safe to call from any thread (e.g. the brain scan thread)
         void broadcast(std::string text);
 
-        /// Count of currently live (non-expired) sessions.
-        [[nodiscard]] std::size_t session_count() const noexcept;
+        /// Count of currently live sessions. Safe to call from any thread
+        /// (reads an atomic — no lock, no strand required).
+        [[nodiscard]] std::size_t session_count() const noexcept {
+            return live_count_.load(std::memory_order_relaxed);
+        }
 
     private:
         void do_accept_();
@@ -54,7 +57,12 @@ namespace brain
         boost::asio::ip::tcp::acceptor acceptor_;
         boost::asio::strand<boost::asio::io_context::executor_type> strand_;
         std::vector<std::weak_ptr<SignalSession>> sessions_;
+<<<<<<< HEAD
         std::atomic<bool> stopped_{false};
+=======
+        std::atomic<bool>        stopped_{false};
+        std::atomic<std::size_t> live_count_{0}; ///< thread-safe session count for health endpoint
+>>>>>>> 37e2fba (Refactor exec process and implement order tracking)
     };
 
     /// One per accepted exec connection. Lifecycle:
