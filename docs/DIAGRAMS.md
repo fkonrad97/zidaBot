@@ -24,7 +24,7 @@ graph TB
         F4[feed — kucoin]
     end
 
-    subgraph Brain ["Brain Process  (single instance)"]
+    subgraph Brain ["Brain Process"]
         WS[WsServer / WsSession]
         UB[UnifiedBook]
         AD[ArbDetector]
@@ -32,9 +32,9 @@ graph TB
         JSONL[(arb.jsonl)]
     end
 
-    subgraph Exec ["Exec Processes  (one per venue)"]
+    subgraph Exec ["Exec Processes (per venue)"]
         WC[WsClient]
-        EE[ExecEngine\nE1–E4 guards]
+        EE[ExecEngine]
         IS[ImmediateStrategy]
         OT[DeadlineOrderTracker]
         OC[StubOrderClient]
@@ -45,17 +45,17 @@ graph TB
     EX3 -->|WS frames| F3
     EX4 -->|WS frames| F4
 
-    F1 -->|book_state JSON\nTLS WS| WS
-    F2 -->|book_state JSON\nTLS WS| WS
-    F3 -->|book_state JSON\nTLS WS| WS
-    F4 -->|book_state JSON\nTLS WS| WS
+    F1 -->|book_state JSON - TLS WS| WS
+    F2 -->|book_state JSON - TLS WS| WS
+    F3 -->|book_state JSON - TLS WS| WS
+    F4 -->|book_state JSON - TLS WS| WS
 
     WS --> UB
     UB -->|venue updated| AD
     AD -->|ArbCross| SS
     AD -->|ArbCross| JSONL
 
-    SS -->|ArbCross JSON\nTLS WS| WC
+    SS -->|ArbCross JSON - TLS WS| WC
     WC -->|dispatch → exec strand| EE
     EE -->|on_signal| IS
     IS --> OT
@@ -70,25 +70,25 @@ How a single arbitrage signal travels from detection in the brain to order dispa
 
 ```mermaid
 flowchart LR
-    A([ArbDetector\nscan]) -->|emit_| B[on_cross_ callback]
-    B -->|broadcast\nJSON text| C[SignalServer]
-    C -->|TLS WS frame| D[WsClient\non_raw_message]
-    D -->|asio::dispatch\nexec strand| E[parse_cross]
-    E -->|ArbCross| F[ExecEngine\non_signal]
+    A([ArbDetector - scan]) -->|emit_| B[on_cross_ callback]
+    B -->|broadcast - JSON text| C[SignalServer]
+    C -->|TLS WS frame| D[WsClient - on_raw_message]
+    D -->|asio::dispatch - exec strand| E[parse_cross]
+    E -->|ArbCross| F[ExecEngine - on_signal]
 
-    F --> G{E4 fat-finger\nprice > cap?}
+    F --> G{E4 fat-finger - price > cap?}
     G -->|reject| Z([drop])
-    G -->|pass| H{E1 position\nlimit breached?}
+    G -->|pass| H{E1 position - limit breached?}
     H -->|reject| Z
-    H -->|pass| I{E2 kill\nswitch paused?}
+    H -->|pass| I{E2 kill - switch paused?}
     I -->|reject| Z
-    I -->|pass| J{E3 cooldown\nnot elapsed?}
+    I -->|pass| J{E3 cooldown - not elapsed?}
     J -->|reject| Z
-    J -->|pass| K[ImmediateStrategy\non_signal]
+    J -->|pass| K[ImmediateStrategy - on_signal]
 
-    K -->|register_pending| L[DeadlineOrderTracker\narm steady_timer]
+    K -->|register_pending| L[DeadlineOrderTracker - arm steady_timer]
     K -->|submit_order| M[StubOrderClient]
-    M -->|fill callback\nexec strand| N[on_fill]
+    M -->|fill callback - exec strand| N[on_fill]
     N -->|cancel timer| L
     N -->|open_notional_ +=| F
 ```
@@ -221,4 +221,221 @@ sequenceDiagram
         OT-->>EE: on_timeout_(client_order_id)
         Note over EE: log WARN — future: pause engine
     end
+```
+
+---
+
+## 5. Feed Layer Class Diagram
+
+Classes in `feed/` (per-venue market data ingestion) and the shared `common/` orderbook library.
+
+```mermaid
+classDiagram
+    class IVenueFeedHandler {
+        <<interface>>
+        +init(FeedHandlerConfig) FeedOpResult
+        +start() FeedOpResult
+        +stop() FeedOpResult
+    }
+
+    class FeedHandlerConfig {
+        +venue_name VenueId
+        +symbol string
+        +base_ccy string
+        +quote_ccy string
+        +ws_host / ws_port / ws_path string
+        +rest_host / rest_port / rest_path string
+        +brain_ws_host / brain_ws_port string
+        +brain_ws_insecure bool
+        +persist_path string
+        +persist_book_every_updates size_t
+        +persist_book_top size_t
+        +max_msg_rate_per_sec int
+    }
+
+    class GenericFeedHandler {
+        -ioc_ io_context
+        -adapter_ VenueAdapter variant
+        -controller_ OrderBookController
+        -ws_client_ WsClient
+        -file_sink_ FilePersistSink
+        -ws_sink_ WsPublishSink
+        -sync_state_ SyncState
+        +init(FeedHandlerConfig) FeedOpResult
+        +start() FeedOpResult
+        +stop() FeedOpResult
+    }
+
+    class VenueAdapter {
+        <<variant>>
+        BinanceAdapter
+        OkxAdapter
+        BybitAdapter
+        BitgetAdapter
+        KucoinAdapter
+        +parse_ws_frame(msg) variant
+        +snapshot_url() string
+        +subscribe_msg() string
+    }
+
+    class OrderBookController {
+        -book_ OrderBook
+        -state_ SyncState
+        -checksum_fn_ ChecksumFn
+        +apply_snapshot(GenericSnapshotFormat) Action
+        +apply_incremental(GenericIncrementalFormat) Action
+        +apply_ws_authoritative(GenericSnapshotFormat) Action
+        +setAllowSequenceGap(bool)
+        +configureChecksum(fn, topN)
+    }
+
+    class OrderBook {
+        -bids_ vector~Level~
+        -asks_ vector~Level~
+        -depth_ size_t
+        +apply(levels, side)
+        +best_bid() Level
+        +best_ask() Level
+        +top(n, side) vector~Level~
+        +validate() bool
+    }
+
+    class WsClient {
+        -strand_ strand
+        -ws_ websocket_stream
+        -outbox_ deque
+        +connect(host, port, path)
+        +send_text(string)
+        +send_binary(string)
+        +set_on_raw_message(handler)
+        +set_tls_verify_peer(bool)
+        +set_client_cert(cert, key)
+        +close()
+    }
+
+    class FilePersistSink {
+        -path_ string
+        -update_count_ size_t
+        +on_snapshot(json)
+        +on_incremental(json)
+        +on_book_state(OrderBook, seq)
+    }
+
+    class WsPublishSink {
+        -ws_client_ WsClient
+        -update_count_ size_t
+        +on_snapshot(json)
+        +on_incremental(json)
+        +on_book_state(OrderBook, seq)
+    }
+
+    IVenueFeedHandler <|-- GenericFeedHandler : implements
+    GenericFeedHandler *-- VenueAdapter : owns (variant)
+    GenericFeedHandler *-- OrderBookController : owns
+    GenericFeedHandler *-- WsClient : owns
+    GenericFeedHandler *-- FilePersistSink : owns
+    GenericFeedHandler *-- WsPublishSink : owns
+    OrderBookController *-- OrderBook : owns
+    WsPublishSink --> WsClient : uses
+```
+
+---
+
+## 6. Brain Layer Class Diagram
+
+Classes in `brain/` — inbound feed server, book aggregation, arb detection, and outbound signal push.
+
+```mermaid
+classDiagram
+    class WsServer {
+        -ioc_ io_context
+        -ssl_ctx_ ssl_context
+        -acceptor_ tcp_acceptor
+        -sessions_ vector~weak_ptr~
+        -on_message_ MessageHandler
+        +start()
+        +stop()
+        +session_count() size_t
+    }
+
+    class WsSession {
+        -ws_ WsStream
+        -buffer_ flat_buffer
+        -on_message_ MessageHandler
+        -remote_addr_ string
+        +run()
+        +close()
+    }
+
+    class UnifiedBook {
+        -books_ vector~VenueBook~
+        -depth_ size_t
+        +on_event(json) string
+        +venues() vector~VenueBook~
+        +synced_count() size_t
+    }
+
+    class VenueBook {
+        +venue_name string
+        +symbol string
+        +controller unique_ptr~OrderBookController~
+        +ts_book_ns int64
+        +feed_healthy bool
+        +synced() bool
+        +book() OrderBook
+    }
+
+    class ArbDetector {
+        -min_spread_bps_ double
+        -max_spread_bps_ double
+        -rate_limit_ns_ int64
+        -max_age_ns_ int64
+        -on_cross_ function
+        +scan(venues vector~VenueBook~)
+        +set_active(bool)
+        +is_active() bool
+        +last_cross_ns() int64
+    }
+
+    class ArbCross {
+        +sell_venue string
+        +buy_venue string
+        +sell_bid_tick int64
+        +buy_ask_tick int64
+        +spread_bps double
+        +ts_detected_ns int64
+        +sell_ts_book_ns int64
+        +buy_ts_book_ns int64
+    }
+
+    class SignalServer {
+        -ioc_ io_context
+        -ssl_ctx_ ssl_context
+        -acceptor_ tcp_acceptor
+        -strand_ strand
+        -sessions_ vector~weak_ptr~
+        -live_count_ atomic_size_t
+        +start()
+        +stop()
+        +broadcast(string)
+        +session_count() size_t
+    }
+
+    class SignalSession {
+        -ws_ WsStream
+        -outbox_ deque~string~
+        -writing_ bool
+        -kMaxOutbox = 64
+        +run()
+        +close()
+        +send(string)
+    }
+
+    WsServer "1" *-- "0..*" WsSession : accepts
+    UnifiedBook "1" *-- "0..*" VenueBook : owns
+    VenueBook *-- OrderBookController : owns
+    ArbDetector --> VenueBook : reads books
+    ArbDetector ..> ArbCross : emits
+    ArbDetector --> SignalServer : on_cross_ callback
+    SignalServer "1" *-- "0..*" SignalSession : accepts
 ```

@@ -1,9 +1,3 @@
-<<<<<<< HEAD
-// exec process entry point — to be implemented in EX6.
-// Connects to brain SignalServer, runs ExecEngine with ImmediateStrategy.
-// TODO(EX6): replace stub with real implementation.
-int main() { return 0; }
-=======
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/signal_set.hpp>
@@ -153,4 +147,3 @@ int main(int argc, char **argv)
     ioc.run();
     return 0;
 }
->>>>>>> 37e2fba (Refactor exec process and implement order tracking)

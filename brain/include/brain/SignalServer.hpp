@@ -57,12 +57,8 @@ namespace brain
         boost::asio::ip::tcp::acceptor acceptor_;
         boost::asio::strand<boost::asio::io_context::executor_type> strand_;
         std::vector<std::weak_ptr<SignalSession>> sessions_;
-<<<<<<< HEAD
-        std::atomic<bool> stopped_{false};
-=======
         std::atomic<bool>        stopped_{false};
         std::atomic<std::size_t> live_count_{0}; ///< thread-safe session count for health endpoint
->>>>>>> 37e2fba (Refactor exec process and implement order tracking)
     };
 
     /// One per accepted exec connection. Lifecycle:
