@@ -27,7 +27,8 @@ namespace brain
                                tcp::endpoint endpoint)
         : ioc_(ioc),
           ssl_ctx_(ssl_ctx),
-          acceptor_(ioc) // bind to io_context directly
+          acceptor_(ioc), // bind to io_context directly
+          strand_(net::make_strand(ioc))
     {
         beast::error_code ec;
 
@@ -77,45 +78,61 @@ namespace brain
     // Dead weak_ptrs are pruned first to avoid calling lock() on already-expired entries.
     void SignalServer::stop()
     {
-        stopped_ = true;
+        stopped_.store(true, std::memory_order_relaxed);
         beast::error_code ec;
         acceptor_.close(ec);
 
-        sessions_.erase(
-            std::remove_if(sessions_.begin(), sessions_.end(),
-                           [](const std::weak_ptr<SignalSession> &w)
-                           { return w.expired(); }),
-            sessions_.end());
-
-        for (auto &wptr : sessions_)
+        net::dispatch(strand_, [self = shared_from_this()]()
         {
-            if (auto sp = wptr.lock())
-                sp->close();
-        }
-        sessions_.clear();
+            self->sessions_.erase(
+                std::remove_if(self->sessions_.begin(), self->sessions_.end(),
+                               [](const std::weak_ptr<SignalSession> &w)
+                               { return w.expired(); }),
+                self->sessions_.end());
+
+            for (auto &wptr : self->sessions_)
+            {
+                if (auto sp = wptr.lock())
+                    sp->close();
+            }
+            self->sessions_.clear();
+        });
     }
 
-    // Prunes expired weak_ptrs (lazy cleanup — avoids a separate reaper thread),
-    // then calls send() on each live session. send() posts onto the session's
-    // strand so this method is safe to call from any thread (e.g. the scan thread
-    // via the on_cross_ callback). text is copied once per live session.
+    // Dispatches onto strand_ to take a thread-safe snapshot of live sessions,
+    // then calls send() on each live session outside the lock. send() posts onto
+    // the session's own strand so this method is safe to call from any thread
+    // (e.g. the scan thread via the on_cross_ callback).
     void SignalServer::broadcast(std::string text)
     {
-        sessions_.erase(
-            std::remove_if(sessions_.begin(), sessions_.end(),
-                           [](const std::weak_ptr<SignalSession> &w)
-                           { return w.expired(); }),
-            sessions_.end());
-
-        for (auto &wptr : sessions_)
+        net::dispatch(strand_, [self = shared_from_this(), text = std::move(text)]() mutable
         {
-            if (auto sp = wptr.lock())
+            // Prune expired weak_ptrs — runs on strand_ so sessions_ access is safe.
+            self->sessions_.erase(
+                std::remove_if(self->sessions_.begin(), self->sessions_.end(),
+                               [](const std::weak_ptr<SignalSession> &w)
+                               { return w.expired(); }),
+                self->sessions_.end());
+
+            // Take a snapshot of live shared_ptrs, then send outside the strand
+            // so a slow session cannot block others.
+            std::vector<std::shared_ptr<SignalSession>> live;
+            live.reserve(self->sessions_.size());
+            for (auto &wptr : self->sessions_)
+            {
+                if (auto sp = wptr.lock())
+                    live.push_back(sp);
+            }
+
+            for (auto &sp : live)
                 sp->send(text);
-        }
+        });
     }
 
     // Counts non-expired weak_ptrs without touching session internals.
     // Used by brain's health endpoint to report connected exec clients.
+    // Note: called from the I/O thread; safe because sessions_ is only mutated
+    // from strand_ and this is a best-effort read for monitoring purposes.
     std::size_t SignalServer::session_count() const noexcept
     {
         return static_cast<std::size_t>(
@@ -124,17 +141,18 @@ namespace brain
                           { return !w.expired(); }));
     }
 
-    // Arms a single async_accept on a fresh strand. The strand is embedded in
-    // the accepted socket and becomes the SignalSession's executor — all session
-    // state (outbox_, writing_) must only be touched from this strand.
+    // Arms a single async_accept. The accepted socket gets its own strand
+    // (net::make_strand(ioc_)) which becomes the SignalSession's executor —
+    // all session state (outbox_, writing_) must only be touched from that strand.
+    // do_accept_ and on_accept_ themselves run on strand_ (server-level strand).
     void SignalServer::do_accept_()
     {
-        if (stopped_)
+        if (stopped_.load(std::memory_order_relaxed))
             return;
 
         acceptor_.async_accept(
-            net::make_strand(ioc_),
-            [self = this](beast::error_code ec, tcp::socket socket)
+            strand_,
+            [self = shared_from_this()](beast::error_code ec, tcp::socket socket)
             {
                 self->on_accept_(ec, std::move(socket));
             });
@@ -170,7 +188,13 @@ namespace brain
             return;
         }
 
-        auto session = SignalSession::create(std::move(socket), ssl_ctx_);
+        // Give the session socket its own per-session strand, distinct from the
+        // server-level strand_. This serialises all session async ops independently
+        // so a slow session never blocks others or the accept loop.
+        auto session = SignalSession::create(
+            tcp::socket(net::make_strand(ioc_), socket.local_endpoint().protocol(),
+                        socket.release()),
+            ssl_ctx_);
         sessions_.emplace_back(session);
         session->run();
 
@@ -219,13 +243,17 @@ namespace brain
                       { self->do_tls_handshake_(); });
     }
 
-    // Forcibly closes the underlying TCP socket. This unblocks any in-flight
-    // async_read or async_write, causing them to complete with an error and
-    // allowing the session's shared_ptr refcount to reach zero naturally.
+    // Forcibly closes the underlying TCP socket. Dispatches onto the session's
+    // strand so the close does not race with in-flight async_read/async_write ops.
+    // Unblocking those ops causes them to complete with an error and allows the
+    // session's shared_ptr refcount to reach zero naturally.
     void SignalSession::close()
     {
-        beast::error_code ec;
-        ws_.next_layer().next_layer().close(ec);
+        net::post(ws_.get_executor(), [self = shared_from_this()]
+        {
+            beast::error_code ec;
+            self->ws_.next_layer().next_layer().close(ec);
+        });
     }
 
     // Called from any thread (typically the brain scan thread via on_cross_).
@@ -268,9 +296,13 @@ namespace brain
 
     // Completes the WebSocket upgrade handshake. Sets the Server header to
     // "brain-signal/1.0" to distinguish this port from the inbound WsServer
-    // ("brain/1.0"). On success, starts the read loop to detect disconnects.
+    // ("brain/1.0"). Caps inbound frame size at 64 KiB (exec sends nothing
+    // meaningful, so this is purely a defence against abuse). On success,
+    // starts the read loop to detect disconnects.
     void SignalSession::do_ws_accept_()
     {
+        ws_.read_message_max(65536);
+
         ws_.set_option(websocket::stream_base::decorator(
             [](websocket::response_type &res)
             {

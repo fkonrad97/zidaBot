@@ -24,6 +24,50 @@ Post-MVP strategies (`ThresholdStrategy`, `SliceStrategy`) tracked as EE1/EE2 in
 
 ---
 
+## Bugs & Quick Fixes — ✅ From Code Review (2026-03-30)
+
+Issues found during code review of `feature/exec-layer`. All items fixed 2026-03-31.
+
+### CRITICAL — Thread Safety
+
+| # | Item | Priority | Status | Files |
+|---|---|---|---|---|
+| CRIT-1 | `SignalServer::sessions_` data race — `broadcast()` runs on scan thread while `on_accept_()` mutates on I/O pool threads; add a server-level `net::strand` and post all `sessions_` access onto it | CRITICAL | ✅ Done | `brain/src/brain/SignalServer.cpp`, `brain/include/brain/SignalServer.hpp` |
+| CRIT-2 | `SignalSession::close()` touches raw TCP socket outside session strand while async ops are in flight — dispatch close onto session's strand via `net::post` | CRITICAL | ✅ Done | `brain/src/brain/SignalServer.cpp` |
+
+### HIGH
+
+| # | Item | Priority | Status | Files |
+|---|---|---|---|---|
+| HIGH-1 | `broadcast()` blocks scan thread while iterating sessions — after CRIT-1 fix, ensure snapshot copy is taken under lock and `send()` called outside lock | HIGH | ✅ Done | `brain/src/brain/SignalServer.cpp` |
+| HIGH-2 | `ImmediateStrategy::strand_` stored as dangling reference; `order_seq_` not atomic — store strand by value, use `std::atomic<uint64_t>` | HIGH | ✅ Done | `exec/include/exec/ImmediateStrategy.hpp` |
+| HIGH-3 | `StubOrderClient::submit_order` fires callback synchronously — post callback onto strand to match async contract | HIGH | ✅ Done | `exec/include/exec/StubOrderClient.hpp` |
+| HIGH-4 | `SignalServer::stopped_` plain `bool` read/written across threads — change to `std::atomic<bool>` | HIGH | ✅ Done | `brain/include/brain/SignalServer.hpp`, `brain/src/brain/SignalServer.cpp` |
+
+### MEDIUM
+
+| # | Item | Priority | Status | Files |
+|---|---|---|---|---|
+| MED-1 | Hot-path `std::string` heap alloc per venue pair in scan inner loop — pre-allocate and reuse buffer | MEDIUM | ✅ Done | `brain/src/brain/ArbDetector.cpp` |
+| MED-2 | Synchronous `j.dump()` + file I/O in `emit_()` on scan thread — defer to background writer thread | MEDIUM | ✅ Done | `brain/src/brain/ArbDetector.cpp`, `brain/include/brain/ArbDetector.hpp` |
+| MED-3 | No `read_message_max` on `SignalSession` — add `ws_.read_message_max(65536)` in `do_ws_accept_()` | MEDIUM | ✅ Done | `brain/src/brain/SignalServer.cpp` |
+| MED-4 | `on_cross_` assigned after scan thread starts — move assignment before scan thread construction | MEDIUM | ✅ Done | `brain/app/brain.cpp` |
+| MED-5 | `SignalServer` lacks server-level strand (root cause of CRIT-1) — add `net::strand strand_` member, bind `do_accept_` and `on_accept_` to it | MEDIUM | ✅ Done | `brain/src/brain/SignalServer.cpp`, `brain/include/brain/SignalServer.hpp` |
+| MED-6 | Per-tick heap alloc for `price_anomaly`/`bids` vectors in `scan()` — use `std::array<T, kMaxVenues>` members | MEDIUM | ✅ Done | `brain/src/brain/ArbDetector.cpp`, `brain/include/brain/ArbDetector.hpp` |
+| MED-7 | Arb signal JSONL missing `schema_version` + `event_type` fields — add to `emit_()` and `serialize_cross()` | MEDIUM | ✅ Done | `brain/src/brain/ArbDetector.cpp`, `brain/app/brain.cpp` |
+
+### LOW
+
+| # | Item | Priority | Status | Files |
+|---|---|---|---|---|
+| LOW-1 | `do_accept_` captures `this` raw — use `shared_from_this` | LOW | ✅ Done | `brain/src/brain/SignalServer.cpp`, `brain/include/brain/SignalServer.hpp` |
+| LOW-2 | `pause()`/`resume()` silent no-ops could pass orders through after kill-switch — consider pure virtual or add `is_paused()` guard in engine | LOW | ✅ Done | `exec/include/exec/IExecStrategy.hpp`, `exec/include/exec/ImmediateStrategy.hpp` |
+| LOW-3 | `exec.cpp` + `placeholder.cpp` are scaffolding stubs — remove before merge | LOW | ✅ Done | `exec/app/exec.cpp`, `exec/src/exec/placeholder.cpp` |
+| LOW-4 | `ArbDetector::flush()` marked `noexcept` but spdlog can throw — wrap body in `try/catch(...)` | LOW | ✅ Done | `brain/include/brain/ArbDetector.hpp` |
+| LOW-5 | Premature semicolon in `BrainCmdLine.hpp` options chain breaks readability | LOW | ✅ Done | `brain/include/brain/BrainCmdLine.hpp` |
+
+---
+
 ## Track A — Correctness & Security Fixes
 
 All items in this track are complete.

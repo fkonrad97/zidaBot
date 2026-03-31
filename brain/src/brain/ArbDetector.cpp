@@ -1,6 +1,7 @@
 #include "brain/ArbDetector.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <spdlog/spdlog.h>
@@ -29,6 +30,8 @@ ArbDetector::ArbDetector(double min_spread_bps,
         if (!output_.is_open())
             spdlog::warn("[ArbDetector] could not open output file: {}", output_path);
     }
+    // MED-2: start background writer thread for JSONL disk I/O.
+    writer_thread_ = std::thread([this]{ writer_loop_(); });
 }
 
 std::int64_t ArbDetector::now_ns_() noexcept {
@@ -65,6 +68,33 @@ void ArbDetector::rotate_output_() {
     output_bytes_ = 0;
 }
 
+// MED-2: background writer loop — drains write_queue_ to disk without blocking
+// the scan thread. Runs until flush() signals write_stop_ = true and the queue
+// is fully drained.
+void ArbDetector::writer_loop_() {
+    while (true) {
+        std::string line;
+        {
+            std::unique_lock<std::mutex> lk(write_mu_);
+            write_cv_.wait(lk, [this]{ return !write_queue_.empty() || write_stop_; });
+            if (write_queue_.empty()) break; // stopped and queue drained
+            line = std::move(write_queue_.front());
+            write_queue_.pop_front();
+        }
+        if (!output_.is_open()) continue;
+        try {
+            output_ << line;
+            output_.flush();
+            output_bytes_ += static_cast<std::uint64_t>(line.size());
+
+            // D3: rotate if size limit reached
+            if (output_max_bytes_ > 0 && output_bytes_ >= output_max_bytes_) {
+                rotate_output_();
+            }
+        } catch (...) {}
+    }
+}
+
 void ArbDetector::emit_(const ArbCross &c) {
     // F4: standby mode — build state but suppress emission
     if (!active_.load(std::memory_order_relaxed)) return;
@@ -81,14 +111,16 @@ void ArbDetector::emit_(const ArbCross &c) {
                  c.sell_venue, c.sell_bid_tick, c.buy_venue, c.buy_ask_tick, c.spread_bps);
 
     // ES1: notify external subscriber (e.g. SignalServer) if a callback is registered.
-    // Placed after all internal guards (active_, counters, latency) so only fully
-    // validated crosses reach the execution layer. The if-check is free when unset.
+    // Fires synchronously before the JSONL write so the execution layer receives the
+    // signal with minimal latency — only the disk write is deferred.
     if (on_cross_) on_cross_(c);
 
-    // Optionally write JSONL
+    // MED-2: defer JSONL serialisation + disk I/O to background writer thread.
     if (!output_.is_open()) return;
     try {
         nlohmann::json j;
+        j["schema_version"]  = 1;          // MED-7
+        j["event_type"]      = "arb_cross"; // MED-7
         j["ts_detected_ns"]  = c.ts_detected_ns;
         j["sell_venue"]      = c.sell_venue;
         j["buy_venue"]       = c.buy_venue;
@@ -98,15 +130,13 @@ void ArbDetector::emit_(const ArbCross &c) {
         j["sell_ts_book_ns"] = c.sell_ts_book_ns;
         j["buy_ts_book_ns"]  = c.buy_ts_book_ns;
         j["lag_ns"]          = lag_ns; // F5: detection latency for offline analysis
-        const std::string line = j.dump() + '\n';
-        output_ << line;
-        output_.flush();
-        output_bytes_ += static_cast<std::uint64_t>(line.size());
+        std::string line = j.dump() + '\n';
 
-        // D3: rotate if size limit reached
-        if (output_max_bytes_ > 0 && output_bytes_ >= output_max_bytes_) {
-            rotate_output_();
-        }
+        std::lock_guard<std::mutex> lk(write_mu_);
+        if (write_queue_.size() >= kWriteQueueCap)
+            write_queue_.pop_front(); // drop oldest to keep queue bounded
+        write_queue_.push_back(std::move(line));
+        write_cv_.notify_one();
     } catch (...) {}
 }
 
@@ -114,32 +144,37 @@ std::vector<ArbCross> ArbDetector::scan(const std::vector<VenueBook> &venues) {
     std::vector<ArbCross> result;
     const std::int64_t ts_now = now_ns_();
 
+    // MED-6: clamp to kMaxVenues to stay within fixed-size array bounds.
+    const std::size_t n_venues = std::min(venues.size(), kMaxVenues);
+
+    // MED-6: reset reusable per-scan arrays — no heap alloc.
+    price_anomaly_buf_.fill(false);
+
     // B5: cross-venue price sanity — compute median best_bid across synced venues.
     // Any venue whose best_bid deviates by more than max_price_deviation_pct_ is
     // excluded from this scan and logged as an anomaly.
-    std::vector<bool> price_anomaly(venues.size(), false);
     if (max_price_deviation_pct_ > 0.0) {
-        std::vector<std::int64_t> bids;
-        bids.reserve(venues.size());
-        for (const auto &vb : venues) {
-            if (!vb.synced()) continue;
-            const std::int64_t bid = vb.book().best_bid().priceTick;
-            if (bid > 0) bids.push_back(bid);
+        std::size_t bids_count = 0;
+        for (std::size_t i = 0; i < n_venues; ++i) {
+            if (!venues[i].synced()) continue;
+            const std::int64_t bid = venues[i].book().best_bid().priceTick;
+            if (bid > 0) bids_buf_[bids_count++] = bid;
         }
-        if (bids.size() >= 2) {
-            std::vector<std::int64_t> sorted_bids = bids;
-            std::sort(sorted_bids.begin(), sorted_bids.end());
-            const double median = (sorted_bids.size() % 2 == 0)
-                ? static_cast<double>(sorted_bids[sorted_bids.size() / 2 - 1]
-                                    + sorted_bids[sorted_bids.size() / 2]) * 0.5
-                : static_cast<double>(sorted_bids[sorted_bids.size() / 2]);
+        if (bids_count >= 2) {
+            // Sort only the filled portion — copy into a local array for sort.
+            std::array<std::int64_t, kMaxVenues> sorted_bids = bids_buf_;
+            std::sort(sorted_bids.begin(), sorted_bids.begin() + bids_count);
+            const double median = (bids_count % 2 == 0)
+                ? static_cast<double>(sorted_bids[bids_count / 2 - 1]
+                                    + sorted_bids[bids_count / 2]) * 0.5
+                : static_cast<double>(sorted_bids[bids_count / 2]);
 
             const double threshold = median * (max_price_deviation_pct_ / 100.0);
-            for (std::size_t i = 0; i < venues.size(); ++i) {
+            for (std::size_t i = 0; i < n_venues; ++i) {
                 if (!venues[i].synced()) continue;
                 const std::int64_t bid = venues[i].book().best_bid().priceTick;
                 if (bid > 0 && std::abs(static_cast<double>(bid) - median) > threshold) {
-                    price_anomaly[i] = true;
+                    price_anomaly_buf_[i] = true;
                     spdlog::warn("[ArbDetector] B5 ANOMALY: venue={} best_bid={} median={} deviation_pct={} > {}",
                                  venues[i].venue_name, bid, static_cast<std::int64_t>(median),
                                  std::abs(static_cast<double>(bid) - median) / median * 100.0,
@@ -149,19 +184,21 @@ std::vector<ArbCross> ArbDetector::scan(const std::vector<VenueBook> &venues) {
         }
     }
 
-    for (std::size_t si = 0; si < venues.size(); ++si) {
+    // MED-1: pre-allocate key buffer once outside the loop to avoid per-pair heap alloc.
+    std::string pair_key;
+    for (std::size_t si = 0; si < n_venues; ++si) {
         const VenueBook &sv = venues[si];
         if (!sv.synced()) continue;
-        if (price_anomaly[si]) continue; // B5: skip anomalous venue
+        if (price_anomaly_buf_[si]) continue; // B5: skip anomalous venue
 
         const std::int64_t sell_bid_tick = sv.book().best_bid().priceTick;
         if (sell_bid_tick == 0) continue; // empty book
 
-        for (std::size_t bi = 0; bi < venues.size(); ++bi) {
+        for (std::size_t bi = 0; bi < n_venues; ++bi) {
             if (bi == si) continue;
             const VenueBook &bv = venues[bi];
             if (!bv.synced()) continue;
-            if (price_anomaly[bi]) continue; // B5: skip anomalous venue
+            if (price_anomaly_buf_[bi]) continue; // B5: skip anomalous venue
 
             const std::int64_t buy_ask_tick = bv.book().best_ask().priceTick;
             if (buy_ask_tick == 0) continue; // empty book
@@ -193,7 +230,11 @@ std::vector<ArbCross> ArbDetector::scan(const std::vector<VenueBook> &venues) {
             }
 
             // B2: per-pair rate limiter — suppress duplicate signals within rate_limit_ns_
-            const std::string pair_key = sv.venue_name + ":" + bv.venue_name;
+            // Reuse pre-allocated key buffer (MED-1: no heap alloc per pair).
+            pair_key.clear();
+            pair_key += sv.venue_name;
+            pair_key += ':';
+            pair_key += bv.venue_name;
             if (!check_rate_limit_(pair_key, ts_now)) continue;
 
             ArbCross cross;

@@ -72,7 +72,7 @@ inline bool parse_brain_cmdline(int argc, char **argv, BrainOptions &out) {
                           "D5: plain-HTTP health endpoint port (0 = disabled); e.g. 8081")
         ("standby",       po::bool_switch()->default_value(false),
                           "F4: start in passive standby mode — receives data but emits no signals; "
-                          "promote to active with SIGUSR1");
+                          "promote to active with SIGUSR1")
         ("signal-port",   po::value<uint16_t>()->default_value(0),
                           "ES2: outbound WebSocket port for exec signal push (0 = disabled)");
 

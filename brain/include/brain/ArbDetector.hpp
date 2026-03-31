@@ -1,11 +1,15 @@
 #pragma once
 
-#include <functional>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <fstream>
+#include <mutex>
 #include <spdlog/spdlog.h>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -47,19 +51,32 @@ public:
                 std::string output_path,
                 std::uint64_t output_max_bytes = 0);
 
+    ~ArbDetector() { flush(); }
+
     /// Scan all directed (sell, buy) venue pairs. Emits each cross to stderr
     /// and optionally to the output JSONL file. Returns all detected crosses.
     std::vector<ArbCross> scan(const std::vector<VenueBook> &venues);
 
-    /// Flush the output file and log latency stats. Call before shutdown.
+    /// Flush the output file and log latency stats. Safe to call multiple times.
     void flush() noexcept {
-        if (output_.is_open()) output_.flush();
-        spdlog::info("[ArbDetector] total crosses emitted: {}", crosses_total_);
-        if (!latency_hist_.empty()) {
-            const auto p = latency_hist_.compute();
-            spdlog::info("[ArbDetector] detection latency (us) p50={} p95={} p99={} n={}",
-                         p.p50_us, p.p95_us, p.p99_us, p.n);
-        }
+        try {
+            // Signal writer thread to drain and exit, then join (idempotent).
+            {
+                std::lock_guard<std::mutex> lk(write_mu_);
+                write_stop_ = true;
+            }
+            write_cv_.notify_one();
+            if (writer_thread_.joinable())
+                writer_thread_.join();
+
+            if (output_.is_open()) output_.flush();
+            spdlog::info("[ArbDetector] total crosses emitted: {}", crosses_total_);
+            if (!latency_hist_.empty()) {
+                const auto p = latency_hist_.compute();
+                spdlog::info("[ArbDetector] detection latency (us) p50={} p95={} p99={} n={}",
+                             p.p50_us, p.p95_us, p.p99_us, p.n);
+            }
+        } catch (...) {}
     }
 
     /// D4: timestamp of the last emitted cross (0 if none yet).
@@ -89,6 +106,9 @@ public:
     /// Must not throw; exceptions propagate to the brain I/O scan thread.
     std::function<void(const ArbCross &)> on_cross_;
 
+    /// MED-6: maximum venues supported by fixed-size per-scan arrays.
+    static constexpr std::size_t kMaxVenues = 16;
+
 private:
     static std::int64_t now_ns_() noexcept;
 
@@ -101,6 +121,9 @@ private:
     /// D3: rotate output file when size limit is reached.
     void rotate_output_();
 
+    /// MED-2: background writer thread loop — drains write_queue_ to disk.
+    void writer_loop_();
+
     double        min_spread_bps_;
     double        max_spread_bps_;        ///< 0 = no upper cap
     std::int64_t  rate_limit_ns_;         ///< 0 = no rate limit
@@ -112,11 +135,23 @@ private:
     std::uint64_t output_bytes_{0};       ///< D3: bytes written to current file
     std::uint32_t output_rotate_seq_{0};  ///< D3: rotation counter for unique filenames
 
+    /// MED-2: bounded queue for background JSONL writer thread.
+    static constexpr std::size_t kWriteQueueCap = 4096;
+    std::deque<std::string>  write_queue_;
+    std::mutex               write_mu_;
+    std::condition_variable  write_cv_;
+    bool                     write_stop_{false};
+    std::thread              writer_thread_;
+
     std::unordered_map<std::string, std::int64_t> last_emit_ns_; ///< keyed "sell:buy"
     std::uint64_t crosses_total_{0};
     std::int64_t  last_cross_ns_{0};   ///< D4: timestamp of the last emitted cross
     std::atomic<bool> active_{true};   ///< F4: false = standby mode, suppress emission
     LatencyHistogram latency_hist_;    ///< F5: detection latency samples
+
+    /// MED-6: per-scan reusable arrays — avoid per-tick heap allocation.
+    std::array<bool, kMaxVenues>         price_anomaly_buf_;
+    std::array<std::int64_t, kMaxVenues> bids_buf_;
 };
 
 } // namespace brain

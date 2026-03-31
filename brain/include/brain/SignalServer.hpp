@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -9,6 +10,7 @@
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ssl/context.hpp>
+#include <boost/asio/strand.hpp>
 #include <boost/beast/core/flat_buffer.hpp>
 #include <boost/beast/ssl.hpp>
 #include <boost/beast/websocket.hpp>
@@ -22,7 +24,7 @@ namespace brain
     /// Outbound-only TLS WebSocket server. Pushes arb cross signals to exec
     /// subscribers. Contrast with WsServer (inbound): sessions here send frames,
     /// not receive them.
-    class SignalServer
+    class SignalServer : public std::enable_shared_from_this<SignalServer>
     {
     public:
         SignalServer(boost::asio::io_context &ioc,
@@ -50,8 +52,9 @@ namespace brain
         boost::asio::io_context &ioc_;
         boost::asio::ssl::context &ssl_ctx_;
         boost::asio::ip::tcp::acceptor acceptor_;
+        boost::asio::strand<boost::asio::io_context::executor_type> strand_;
         std::vector<std::weak_ptr<SignalSession>> sessions_;
-        bool stopped_{false};
+        std::atomic<bool> stopped_{false};
     };
 
     /// One per accepted exec connection. Lifecycle:

@@ -50,14 +50,16 @@ struct HealthSnapshot
 static std::string serialize_cross(const brain::ArbCross &c)
 {
     nlohmann::json j;
-    j["ts_detected_ns"] = c.ts_detected_ns;
-    j["sell_venue"] = c.sell_venue;
-    j["buy_venue"] = c.buy_venue;
-    j["sell_bid_tick"] = c.sell_bid_tick;
-    j["buy_ask_tick"] = c.buy_ask_tick;
-    j["spread_bps"] = c.spread_bps;
+    j["schema_version"]  = 1;           // MED-7
+    j["event_type"]      = "arb_cross"; // MED-7
+    j["ts_detected_ns"]  = c.ts_detected_ns;
+    j["sell_venue"]      = c.sell_venue;
+    j["buy_venue"]       = c.buy_venue;
+    j["sell_bid_tick"]   = c.sell_bid_tick;
+    j["buy_ask_tick"]    = c.buy_ask_tick;
+    j["spread_bps"]      = c.spread_bps;
     j["sell_ts_book_ns"] = c.sell_ts_book_ns;
-    j["buy_ts_book_ns"] = c.buy_ts_book_ns;
+    j["buy_ts_book_ns"]  = c.buy_ts_book_ns;
     return j.dump();
 }
 
@@ -242,7 +244,9 @@ int main(int argc, char **argv)
     brain::WsServer server(ioc, ssl_ctx, ep, on_message);
     server.start();
 
-    // ES2: optional outbound signal channel — pushes ArbCross JSON to exec processes.
+    // ---- ES2: optional outbound signal channel — pushes ArbCross JSON to exec processes.
+    // MED-4: on_cross_ is assigned here, before ioc.run() and before any events are
+    // processed by the scan thread, ensuring the callback is visible on first scan.
     // Disabled when --signal-port is 0 (default).
     std::unique_ptr<brain::SignalServer> signal_server;
     if (opts.signal_port > 0)

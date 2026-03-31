@@ -20,6 +20,11 @@ public:
     /// E2 kill switch — strategy must stop submitting new orders when paused.
     virtual void pause()  {}
     virtual void resume() {}
+
+    /// Returns true if the strategy is currently paused.
+    /// Engine should check this before calling on_signal() rather than relying
+    /// solely on strategy self-censorship.
+    [[nodiscard]] virtual bool is_paused() const noexcept = 0;
 };
 
 } // namespace exec
