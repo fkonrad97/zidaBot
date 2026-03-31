@@ -52,3 +52,4 @@ sim_results/*
 arb_results.csv
 scripts/__pycache__/*
 CLAUDE.md
+/.claude/
