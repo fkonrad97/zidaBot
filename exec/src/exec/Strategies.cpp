@@ -9,11 +9,13 @@ ImmediateStrategy::ImmediateStrategy(
     std::string            my_venue,
     IOrderClient          &client,
     OrderTracker          &tracker,
+    std::function<void(const Fill &)> on_fill,
     boost::asio::strand<boost::asio::io_context::executor_type> strand,
     double                 target_qty)
     : my_venue_(std::move(my_venue))
     , client_(client)
     , tracker_(tracker)
+    , on_fill_(std::move(on_fill))
     , strand_(strand)
     , target_qty_(target_qty) {}
 
@@ -66,7 +68,11 @@ void ImmediateStrategy::on_signal(const brain::ArbCross &cross) {
             }
             spdlog::info("[ImmediateStrategy] FILL id={} qty={} price_tick={}",
                          fill.client_order_id, fill.filled_qty, fill.fill_price_tick);
+            // A confirmed fill has two separate side effects:
+            //   1. clear E5 timeout tracking for this order
+            //   2. feed E1 position accounting in ExecEngine via on_fill_
             tracker_.on_fill(fill);
+            if (on_fill_) on_fill_(fill);
         });
 }
 

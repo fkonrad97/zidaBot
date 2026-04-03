@@ -37,7 +37,9 @@ graph TB
         EE[ExecEngine]
         IS[ImmediateStrategy]
         OT[DeadlineOrderTracker]
-        OC[StubOrderClient]
+        DC[DryRunOrderClient]
+        LG[Live rollout guards]
+        OC[Venue order client]
     end
 
     EX1 -->|WS frames| F1
@@ -57,8 +59,10 @@ graph TB
 
     SS -->|ArbCross JSON - TLS WS| WC
     WC -->|dispatch → exec strand| EE
+    LG -->|startup validation| EE
     EE -->|on_signal| IS
     IS --> OT
+    IS --> DC
     IS --> OC
 ```
 
@@ -87,10 +91,13 @@ flowchart LR
     J -->|pass| K[ImmediateStrategy - on_signal]
 
     K -->|register_pending| L[DeadlineOrderTracker - arm steady_timer]
-    K -->|submit_order| M[StubOrderClient]
+    K -->|submit_order| M[Order client]
     M -->|fill callback - exec strand| N[on_fill]
     N -->|cancel timer| L
     N -->|open_notional_ +=| F
+
+    Note over M: In dry-run mode, Order client = DryRunOrderClient
+    Note over M: In live mode, startup guards must pass first
 ```
 
 ---
@@ -108,6 +115,12 @@ classDiagram
     }
 
     class StubOrderClient {
+        -strand_ strand
+        +submit_order(Order, callback) void
+        +cancel_order(string, callback) void
+    }
+
+    class DryRunOrderClient {
         -strand_ strand
         +submit_order(Order, callback) void
         +cancel_order(string, callback) void
@@ -143,6 +156,7 @@ classDiagram
         -my_venue_ string
         -client_ IOrderClient&
         -tracker_ OrderTracker&
+        -on_fill_ function
         -strand_ strand
         -target_qty_ double
         -paused_ atomic~bool~
@@ -168,12 +182,21 @@ classDiagram
         +resume() void
     }
 
+    class ExecOptions {
+        +dry_run bool
+        +arm_live bool
+        +enable_live_venue string
+        +live_order_notional_cap double
+    }
+
     IOrderClient <|-- StubOrderClient : implements
+    IOrderClient <|-- DryRunOrderClient : implements
     OrderTracker <|-- DeadlineOrderTracker : implements
     IExecStrategy <|-- ImmediateStrategy : implements
     ImmediateStrategy --> IOrderClient : uses
     ImmediateStrategy --> OrderTracker : uses
     ExecEngine *-- IExecStrategy : owns
+    ExecOptions --> ExecEngine : configures startup mode
 ```
 
 ---
@@ -190,13 +213,19 @@ sequenceDiagram
     participant EE as ExecEngine
     participant IS as ImmediateStrategy
     participant OT as DeadlineOrderTracker
-    participant OC as StubOrderClient
+    participant OC as OrderClient
 
     AD->>SS: broadcast(ArbCross JSON)
     SS-->>WC: TLS WS text frame
 
     WC->>WC: on_raw_message (WsClient strand)
     WC->>EE: asio::dispatch → exec strand<br/>on_signal(ArbCross)
+
+    Note over EE: Startup mode
+    Note over EE: default = dry-run
+    Note over EE: live requires --live-mode + --arm-live
+    Note over EE: live also requires exact venue gate
+    Note over EE: and tiny-notional clamp
 
     Note over EE: E4: ref_price ≤ max_order_notional?
     Note over EE: E1: open_notional + new ≤ position_limit?
@@ -221,6 +250,9 @@ sequenceDiagram
         OT-->>EE: on_timeout_(client_order_id)
         Note over EE: log WARN — future: pause engine
     end
+
+    Note over OC: DryRunOrderClient synthesizes fills locally
+    Note over OC: Live order clients are future venue adapters
 ```
 
 ---

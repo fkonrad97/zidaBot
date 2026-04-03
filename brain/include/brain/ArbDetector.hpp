@@ -23,7 +23,8 @@ struct ArbCross {
     std::string buy_venue;        ///< venue where we buy
     std::int64_t sell_bid_tick;   ///< sell_venue best_bid.priceTick
     std::int64_t buy_ask_tick;    ///< buy_venue best_ask.priceTick
-    double       spread_bps;
+    double       spread_bps;      ///< raw spread before fees
+    double       net_spread_bps;  ///< fee-adjusted spread (spread_bps − sell_fee − buy_fee)
     std::int64_t ts_detected_ns;
     std::int64_t sell_ts_book_ns; ///< age of the sell-venue book at detection time
     std::int64_t buy_ts_book_ns;  ///< age of the buy-venue book at detection time
@@ -43,13 +44,18 @@ public:
     ///                                the median across all synced venues (0 = disabled)
     /// @param output_path             Optional JSONL output file path
     /// @param output_max_bytes        D3: rotate output file after this many bytes (0 = no rotation)
+    /// @param venue_fee_bps  Per-venue taker fee in basis points, keyed by venue name
+    ///                       (e.g. {"binance": 10, "okx": 8}).  Missing entries default
+    ///                       to 0 bps.  Used to compute net_spread_bps = spread_bps −
+    ///                       sell_fee − buy_fee; min_spread_bps is applied to net spread.
     ArbDetector(double min_spread_bps,
                 double max_spread_bps,
                 std::int64_t rate_limit_ns,
                 std::int64_t max_age_diff_ns,
                 double max_price_deviation_pct,
                 std::string output_path,
-                std::uint64_t output_max_bytes = 0);
+                std::uint64_t output_max_bytes = 0,
+                std::unordered_map<std::string, double> venue_fee_bps = {});
 
     ~ArbDetector() { flush(); }
 
@@ -112,6 +118,9 @@ public:
 private:
     static std::int64_t now_ns_() noexcept;
 
+    /// Returns the taker fee for a venue in bps (0 if venue not configured).
+    double fee_for_(const std::string &venue) const noexcept;
+
     /// Returns true if the signal should be emitted (rate limit not exceeded).
     /// Updates last_emit_ns_ on return true.
     bool check_rate_limit_(const std::string &key, std::int64_t ts_now) noexcept;
@@ -124,6 +133,7 @@ private:
     /// MED-2: background writer thread loop — drains write_queue_ to disk.
     void writer_loop_();
 
+    std::unordered_map<std::string, double> venue_fee_bps_; ///< taker fee per venue in bps
     double        min_spread_bps_;
     double        max_spread_bps_;        ///< 0 = no upper cap
     std::int64_t  rate_limit_ns_;         ///< 0 = no rate limit

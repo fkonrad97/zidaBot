@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <string>
 
 #include <boost/asio/strand.hpp>
@@ -21,11 +22,13 @@ public:
     /// @param my_venue     venue this exec instance is responsible for
     /// @param client       order submission interface (stub or real)
     /// @param tracker      E5: registers pending orders for confirmation tracking
+    /// @param on_fill      optional callback invoked for confirmed fills on the exec strand
     /// @param strand       Asio strand — all async callbacks run here (stored by value)
     /// @param target_qty   max qty per leg in base currency (0 = full level-0)
     ImmediateStrategy(std::string            my_venue,
                       IOrderClient          &client,
                       OrderTracker          &tracker,
+                      std::function<void(const Fill &)> on_fill,
                       boost::asio::strand<boost::asio::io_context::executor_type> strand,
                       double                 target_qty = 0.0);
 
@@ -41,6 +44,7 @@ private:
     std::string    my_venue_;
     IOrderClient  &client_;
     OrderTracker  &tracker_;
+    std::function<void(const Fill &)> on_fill_;
     boost::asio::strand<boost::asio::io_context::executor_type> strand_;
     double         target_qty_;
     std::atomic<bool> paused_{false};

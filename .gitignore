@@ -53,3 +53,5 @@ arb_results.csv
 scripts/__pycache__/*
 CLAUDE.md
 /.claude/
+/vm/*
+.DS_Store

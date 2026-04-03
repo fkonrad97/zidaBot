@@ -17,8 +17,10 @@ ArbDetector::ArbDetector(double min_spread_bps,
                          std::int64_t max_age_diff_ns,
                          double max_price_deviation_pct,
                          std::string output_path,
-                         std::uint64_t output_max_bytes)
-    : min_spread_bps_(min_spread_bps),
+                         std::uint64_t output_max_bytes,
+                         std::unordered_map<std::string, double> venue_fee_bps)
+    : venue_fee_bps_(std::move(venue_fee_bps)),
+      min_spread_bps_(min_spread_bps),
       max_spread_bps_(max_spread_bps),
       rate_limit_ns_(rate_limit_ns),
       max_age_diff_ns_(max_age_diff_ns),
@@ -32,6 +34,11 @@ ArbDetector::ArbDetector(double min_spread_bps,
     }
     // MED-2: start background writer thread for JSONL disk I/O.
     writer_thread_ = std::thread([this]{ writer_loop_(); });
+}
+
+double ArbDetector::fee_for_(const std::string &venue) const noexcept {
+    auto it = venue_fee_bps_.find(venue);
+    return it != venue_fee_bps_.end() ? it->second : 0.0;
 }
 
 std::int64_t ArbDetector::now_ns_() noexcept {
@@ -107,8 +114,9 @@ void ArbDetector::emit_(const ArbCross &c) {
         c.ts_detected_ns - std::max(c.sell_ts_book_ns, c.buy_ts_book_ns);
     if (lag_ns > 0) latency_hist_.record(lag_ns);
 
-    spdlog::info("[ARB] sell={} bid={} buy={} ask={} spread={}bps",
-                 c.sell_venue, c.sell_bid_tick, c.buy_venue, c.buy_ask_tick, c.spread_bps);
+    spdlog::info("[ARB] sell={} bid={} buy={} ask={} spread={}bps net={}bps",
+                 c.sell_venue, c.sell_bid_tick, c.buy_venue, c.buy_ask_tick,
+                 c.spread_bps, c.net_spread_bps);
 
     // ES1: notify external subscriber (e.g. SignalServer) if a callback is registered.
     // Fires synchronously before the JSONL write so the execution layer receives the
@@ -127,6 +135,7 @@ void ArbDetector::emit_(const ArbCross &c) {
         j["sell_bid_tick"]   = c.sell_bid_tick;
         j["buy_ask_tick"]    = c.buy_ask_tick;
         j["spread_bps"]      = c.spread_bps;
+        j["net_spread_bps"]  = c.net_spread_bps;
         j["sell_ts_book_ns"] = c.sell_ts_book_ns;
         j["buy_ts_book_ns"]  = c.buy_ts_book_ns;
         j["lag_ns"]          = lag_ns; // F5: detection latency for offline analysis
@@ -220,14 +229,21 @@ std::vector<ArbCross> ArbDetector::scan(const std::vector<VenueBook> &venues) {
             if (mid <= 0.0) continue; // guard against degenerate ticks
             const double spread_bps = (spread_abs / mid) * 10000.0;
 
-            if (spread_bps < min_spread_bps_) continue;
-
-            // B1: upper spread cap — anomalously large spreads indicate a data error
+            // B1: upper spread cap — anomalously large spreads indicate a data error.
+            // Applied to raw spread before fee adjustment (data quality guard, not profit filter).
             if (max_spread_bps_ > 0.0 && spread_bps > max_spread_bps_) {
                 spdlog::warn("[ArbDetector] ANOMALY: spread {}bps exceeds cap {}bps sell={} buy={}",
                              spread_bps, max_spread_bps_, sv.venue_name, bv.venue_name);
                 continue;
             }
+
+            // Fee-adjusted spread: subtract taker fees for both legs.
+            // min_spread_bps_ is applied to net spread so only profitable crosses are emitted.
+            const double sell_fee_bps  = fee_for_(sv.venue_name);
+            const double buy_fee_bps   = fee_for_(bv.venue_name);
+            const double net_spread_bps = spread_bps - sell_fee_bps - buy_fee_bps;
+
+            if (net_spread_bps < min_spread_bps_) continue;
 
             // B2: per-pair rate limiter — suppress duplicate signals within rate_limit_ns_
             // Reuse pre-allocated key buffer (MED-1: no heap alloc per pair).
@@ -243,6 +259,7 @@ std::vector<ArbCross> ArbDetector::scan(const std::vector<VenueBook> &venues) {
             cross.sell_bid_tick    = sell_bid_tick;
             cross.buy_ask_tick     = buy_ask_tick;
             cross.spread_bps       = spread_bps;
+            cross.net_spread_bps   = net_spread_bps;
             cross.ts_detected_ns   = ts_now;
             cross.sell_ts_book_ns  = sv.ts_book_ns;
             cross.buy_ts_book_ns   = bv.ts_book_ns;

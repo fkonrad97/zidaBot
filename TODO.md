@@ -4,6 +4,20 @@
 
 ---
 
+## Batch 14 — 🔄 In Progress
+
+Execution safety hardening before any live venue rollout. Goal: make the exec path safe to validate on real connections without risking capital.
+
+| # | Item | Status | Files |
+|---|---|---|---|
+| EX7 | Wire strategy fill callback into `ExecEngine::on_fill()` so E1 position accounting works end-to-end | ✅ Done | `exec/include/exec/ImmediateStrategy.hpp`, `exec/src/exec/Strategies.cpp`, `exec/app/exec.cpp`, `tests/exec/test_exec_pipeline.cpp` |
+| EX8 | Harden `venue-fees` parsing: trim whitespace, warn on malformed tokens, reject negative fees, sanity-check config | ✅ Done | `brain/include/brain/BrainCmdLine.hpp`, `tests/brain/test_brain_cmdline.cpp` |
+| EX9 | Add paper / dry-run execution mode for venue adapter validation with no live order submission | ✅ Done | `exec/include/exec/DryRunOrderClient.hpp`, `exec/include/exec/ExecCmdLine.hpp`, `exec/app/exec.cpp`, `tests/exec/test_dry_run_order_client.cpp`, `tests/exec/test_exec_cmdline.cpp` |
+| EX10 | Add venue rollout controls: arming flag, tiny-notional clamp, one-venue-at-a-time enable gate | ✅ Done | `exec/include/exec/ExecCmdLine.hpp`, `exec/app/exec.cpp`, `tests/exec/test_exec_cmdline.cpp` |
+| EX11 | Add safe venue validation flow: unit/replay/testnet/live-disabled docs and checklists | ✅ Done | `docs/HOWTO.md`, `docs/DIAGRAMS.md`, `progress/2026-04-03.md` |
+
+---
+
 ## Batch 13 — ⬜ Planned
 
 Execution layer MVP: signal broadcast from brain + exec process with pluggable strategies and E1–E5 safety guards.

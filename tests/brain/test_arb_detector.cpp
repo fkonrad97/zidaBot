@@ -36,14 +36,17 @@ static VenueBook make_synced(std::string venue,
 
 /// Default permissive ArbDetector (no rate limit, no age guard, no file output).
 static ArbDetector make_detector(double min_bps = 0.1,
-                                  double max_bps = 0.0) {
+                                  double max_bps = 0.0,
+                                  std::unordered_map<std::string, double> fees = {}) {
     return ArbDetector(
         min_bps,
         max_bps,
         0,           // rate_limit_ns  = off
         0,           // max_age_diff_ns = off
         0.0,         // max_price_deviation_pct = off
-        ""           // no output file
+        "",          // no output file
+        0,           // output_max_bytes = off
+        std::move(fees)
     );
 }
 
@@ -251,7 +254,7 @@ TEST(ArbDetector, OnCrossCallbackReceivesCorrectCrossFields) {
 
 TEST(ArbDetector, OnCrossCallbackSuppressedByRateLimit) {
     // rate limit of 1000 seconds → only first scan emits
-    ArbDetector det(0.1, 0.0, 1'000'000'000'000LL, 0, 0.0, "");
+    ArbDetector det(0.1, 0.0, 1'000'000'000'000LL, 0, 0.0, "", 0);
     int fired = 0;
     det.on_cross_ = [&fired](const brain::ArbCross &) { ++fired; };
     const std::int64_t ts = now_ns();
@@ -266,4 +269,67 @@ TEST(ArbDetector, OnCrossCallbackSuppressedByRateLimit) {
     det.scan(make_v());
     det.scan(make_v());
     EXPECT_EQ(fired, 1); // second emission suppressed by rate limit
+}
+
+// ── fee-adjusted spread ───────────────────────────────────────────────────────
+
+TEST(ArbDetector, FeeAdjustedSpread_SuppressedWhenNetBelowMin) {
+    // sell_bid=10010, buy_ask=9990 → spread=(20/10000)*10000 = 20 bps.
+    // With sell_fee=10bps + buy_fee=10bps → net = 20 - 20 = 0 bps.
+    // min_spread_bps=0.1 → net(0) < min(0.1) → suppressed.
+    auto det = make_detector(/*min_bps=*/0.1, /*max_bps=*/0.0,
+                             {{"binance", 10.0}, {"okx", 10.0}});
+    const std::int64_t ts = now_ns();
+    std::vector<VenueBook> v;
+    v.push_back(make_synced("binance", 10010, 10200, ts));
+    v.push_back(make_synced("okx",     10000,  9990, ts));
+
+    auto crosses = det.scan(v);
+    EXPECT_TRUE(crosses.empty());
+}
+
+TEST(ArbDetector, FeeAdjustedSpread_PassesWhenNetAboveMin) {
+    // sell_bid=10010, buy_ask=9990 → raw spread = 20 bps.
+    // Fees: sell=5bps + buy=5bps → net = 10 bps > min=0.1 → passes.
+    auto det = make_detector(/*min_bps=*/0.1, /*max_bps=*/0.0,
+                             {{"binance", 5.0}, {"okx", 5.0}});
+    const std::int64_t ts = now_ns();
+    std::vector<VenueBook> v;
+    v.push_back(make_synced("binance", 10010, 10200, ts));
+    v.push_back(make_synced("okx",     10000,  9990, ts));
+
+    auto crosses = det.scan(v);
+    ASSERT_EQ(crosses.size(), 1u);
+    EXPECT_GT(crosses[0].net_spread_bps, 0.0);
+    EXPECT_LT(crosses[0].net_spread_bps, crosses[0].spread_bps); // net < raw
+}
+
+TEST(ArbDetector, FeeAdjustedSpread_MissingVenueDefaultsToZeroFee) {
+    // Only okx fee configured; binance defaults to 0.
+    // net = raw(20bps) - 0(binance) - 8(okx) = 12bps > min=0.1 → passes.
+    auto det = make_detector(/*min_bps=*/0.1, /*max_bps=*/0.0,
+                             {{"okx", 8.0}});
+    const std::int64_t ts = now_ns();
+    std::vector<VenueBook> v;
+    v.push_back(make_synced("binance", 10010, 10200, ts));
+    v.push_back(make_synced("okx",     10000,  9990, ts));
+
+    auto crosses = det.scan(v);
+    ASSERT_EQ(crosses.size(), 1u);
+    EXPECT_GT(crosses[0].net_spread_bps, 0.0);
+}
+
+TEST(ArbDetector, FeeAdjustedSpread_NetStoredInCross) {
+    // Verify net_spread_bps == spread_bps - sell_fee - buy_fee.
+    // sell_fee(binance)=10, buy_fee(okx)=8. Raw spread = 20 bps → net = 2 bps.
+    auto det = make_detector(0.0, 0.0, {{"binance", 10.0}, {"okx", 8.0}});
+    const std::int64_t ts = now_ns();
+    std::vector<VenueBook> v;
+    v.push_back(make_synced("binance", 10010, 10200, ts));
+    v.push_back(make_synced("okx",     10000,  9990, ts));
+
+    auto crosses = det.scan(v);
+    ASSERT_EQ(crosses.size(), 1u);
+    const double expected_net = crosses[0].spread_bps - 10.0 - 8.0;
+    EXPECT_NEAR(crosses[0].net_spread_bps, expected_net, 1e-9);
 }

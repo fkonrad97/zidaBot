@@ -15,14 +15,12 @@ ExecEngine::ExecEngine(std::string                    my_venue,
     , cooldown_ns_(cooldown_ns)
     , strategy_(std::move(strategy)) {}
 
-// Applies pre-trade guards in order E4 → E1 → E2 → E3, then dispatches to strategy.
-//
 // Guard rationale:
-//   E4 first — cheapest check (single comparison against a config constant). Catches
+//   first — cheapest check (single comparison against a config constant). Catches
 //              obviously wrong prices before any state is consulted.
-//   E1 second — reads open_notional_ (one double compare). Position circuit-breaker.
-//   E2 third  — atomic load. Kill switch; rarely true but must be checked every signal.
-//   E3 last   — unordered_map lookup + string concat. Most expensive guard, but only
+//   second — reads open_notional_ (one double compare). Position circuit-breaker.
+//   third  — atomic load. Kill switch; rarely true but must be checked every signal.
+//   last   — unordered_map lookup + string concat. Most expensive guard, but only
 //               reached by signals that passed all price/risk checks.
 void ExecEngine::on_signal(const brain::ArbCross &cross) {
     // E4: fat-finger — sell_bid_tick is the larger price in any arb cross

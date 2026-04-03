@@ -58,6 +58,7 @@ static std::string serialize_cross(const brain::ArbCross &c)
     j["sell_bid_tick"]   = c.sell_bid_tick;
     j["buy_ask_tick"]    = c.buy_ask_tick;
     j["spread_bps"]      = c.spread_bps;
+    j["net_spread_bps"]  = c.net_spread_bps;
     j["sell_ts_book_ns"] = c.sell_ts_book_ns;
     j["buy_ts_book_ns"]  = c.buy_ts_book_ns;
     return j.dump();
@@ -124,7 +125,8 @@ int main(int argc, char **argv)
         opts.max_age_ms * 1'000'000LL,
         opts.max_price_deviation_pct,
         opts.output,
-        output_max_bytes);
+        output_max_bytes,
+        opts.venue_fee_bps);
     // F4: standby mode — suppress signal emission until promoted via SIGUSR1
     if (opts.standby)
     {
@@ -383,6 +385,13 @@ int main(int argc, char **argv)
                  opts.output_max_mb > 0 ? std::to_string(opts.output_max_mb) + "MB" : "no-rotation",
                  opts.watchdog_no_cross_sec > 0 ? std::to_string(opts.watchdog_no_cross_sec) + "s" : "off",
                  opts.ca_certfile.empty() ? "off" : "on");
+
+    if (!opts.venue_fee_bps.empty()) {
+        for (const auto &[venue, fee] : opts.venue_fee_bps)
+            spdlog::info("[brain] venue fee: {}={}bps", venue, fee);
+    } else {
+        spdlog::info("[brain] venue fees: none configured (net_spread == raw spread)");
+    }
 
     // G2: run I/O thread pool — safe because all WsSession handlers use strands.
     const unsigned n_ioc_threads =

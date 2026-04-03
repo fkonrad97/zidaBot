@@ -19,6 +19,7 @@ End-to-end guide covering prerequisites, build, TLS/mTLS setup, config files, an
 11. [Health Endpoint](#11-health-endpoint)
 12. [Production Deployment (systemd / supervisord)](#12-production-deployment-systemd--supervisord)
 13. [Backtesting with zidabot_replay](#13-backtesting-with-zidabot_replay)
+14. [Execution Safety and Venue Rollout](#14-execution-safety-and-venue-rollout)
 
 ---
 
@@ -248,6 +249,23 @@ Brain must be started **before** PoP instances connect.
 
 Brain prints detected arb crosses to **stderr** and optionally to the `--output` JSONL file. PoP connections/disconnections are also logged to stderr.
 
+### Fee-aware spread config
+
+`brain` now supports `--venue-fees` so the detector can subtract per-venue taker fees before applying `min-spread-bps`.
+
+Example:
+```bash
+./build/brain/brain --config config/brain.conf \
+  --venue-fees binance:10,okx:8,bybit:10
+```
+
+Important behavior:
+- Whitespace is trimmed, so `binance: 10` is accepted.
+- Malformed tokens are skipped with a warning instead of failing silently.
+- Negative fees are rejected.
+- Very large fees are accepted with a warning so operator mistakes are visible.
+- If `min-spread-bps > max-spread-bps`, brain logs a warning because no crosses will emit.
+
 ---
 
 ## 6. Running PoP
@@ -258,6 +276,139 @@ One PoP process per venue. Requires `--venue` and either `--symbols` or `--base`
 ```bash
 ./build/pop/pop --config config/binance.conf
 ```
+
+---
+
+## 14. Execution Safety and Venue Rollout
+
+This section covers the exec-side changes added after the initial execution-layer MVP. The short version is:
+
+- `exec` is now **safe by default**
+- dry-run is the normal first step
+- live mode requires several explicit acknowledgements and size limits
+
+### 14a. What changed
+
+The exec pipeline now has four important safety improvements:
+
+1. **Live fills now update E1 correctly**
+   `ImmediateStrategy` forwards confirmed fills into `ExecEngine::on_fill()`, so the position-limit guard is no longer a unit-test-only behavior.
+
+2. **Dry-run mode**
+   `DryRunOrderClient` logs orders and synthesizes async fills locally. This lets us validate the brain → exec → strategy → tracker path without touching a venue.
+
+3. **Safe default startup**
+   `exec` now starts in dry-run mode unless you explicitly request live mode.
+
+4. **Live rollout gates**
+   Live execution requires:
+   - `--live-mode`
+   - `--arm-live`
+   - `--enable-live-venue <same-as---venue>`
+   - `--max-order-notional > 0`
+   - `target_qty * max_order_notional <= live_order_notional_cap`
+
+### 14b. What the live gates mean
+
+These guards exist to stop accidental order placement during rollout:
+
+- `--live-mode`
+  This is the switch that disables the default dry-run behavior.
+
+- `--arm-live`
+  This is an explicit acknowledgement that you really intend to leave simulation mode.
+
+- `--enable-live-venue`
+  This must exactly match `--venue`. It prevents broad shared configs from accidentally enabling live trading on the wrong venue process.
+
+- `--live-order-notional-cap`
+  This is the tiny-notional clamp. Startup fails if:
+  `target_qty * max_order_notional > live_order_notional_cap`
+
+  The default cap is `25` USD. That gives us a hard, easy-to-understand rollout ceiling.
+
+### 14c. Dry-run examples
+
+Recommended first step for any venue validation:
+
+```bash
+./build/exec \
+  --venue binance \
+  --brain-host 127.0.0.1 \
+  --brain-port 9001 \
+  --dry-run \
+  --target-qty 0.01 \
+  --max-order-notional 100 \
+  --position-limit 250 \
+  --cooldown-ms 1000
+```
+
+What this does:
+- receives real signals from brain
+- applies `ExecEngine` guards
+- logs orders locally
+- produces synthetic fills on the exec strand
+- exercises `DeadlineOrderTracker` and E1 accounting without exchange risk
+
+### 14d. Live-mode example
+
+Only use this after dry-run and replay checks look correct:
+
+```bash
+./build/exec \
+  --venue binance \
+  --brain-host 127.0.0.1 \
+  --brain-port 9001 \
+  --live-mode \
+  --arm-live \
+  --enable-live-venue binance \
+  --target-qty 0.10 \
+  --max-order-notional 100 \
+  --live-order-notional-cap 25 \
+  --position-limit 250 \
+  --cooldown-ms 1000
+```
+
+If any live rollout guard is missing, `exec` refuses to start.
+
+### 14e. Recommended rollout order
+
+Use this order every time we bring up a new venue adapter:
+
+1. **Unit tests**
+   Confirm parser, signing, and pure logic behavior locally.
+
+2. **Replay / backtest**
+   Feed recorded events through brain and validate that signal generation looks sane.
+
+3. **Dry-run exec**
+   Connect real brain signals into `exec --dry-run` and inspect logs, cooldown behavior, tracker behavior, and E1 accumulation.
+
+4. **Venue testnet / sandbox**
+   If the venue offers a safe environment, validate request/response plumbing there before any live orders.
+
+5. **Live connectivity with trading still disabled**
+   Confirm TLS, auth, subscriptions, and status handling without allowing order flow.
+
+6. **Tiny live rollout**
+   Start with one venue, one process, tiny notional, explicit live gates, and close observation.
+
+### 14f. Operator checklist
+
+Before live mode:
+- confirm `brain` is running and signals look sane
+- confirm `exec --dry-run` logs the expected venue side and price
+- confirm cooldown and position-limit settings are deliberate
+- confirm `target_qty * max_order_notional` is below the live cap
+- confirm `--enable-live-venue` exactly matches `--venue`
+- confirm only one venue process is being armed at a time
+
+During first live rollout:
+- tail exec logs continuously
+- keep `position-limit` small
+- keep `target-qty` tiny
+- keep `max-order-notional` realistic and bounded
+- stop immediately on unexpected fills, repeated timeouts, or wrong-side orders
 
 **Minimal single-symbol (no persistence, no brain):**
 ```bash

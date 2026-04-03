@@ -1,12 +1,64 @@
 #pragma once
 
+#include <algorithm>
 #include <boost/program_options.hpp>
+#include <cctype>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <string>
+#include <unordered_map>
+
+#include <spdlog/spdlog.h>
 
 namespace brain {
+
+inline std::string trim_ascii_whitespace(std::string s) {
+    const auto not_space = [](unsigned char ch) { return !std::isspace(ch); };
+    const auto begin = std::find_if(s.begin(), s.end(), not_space);
+    if (begin == s.end()) return {};
+    const auto end = std::find_if(s.rbegin(), s.rend(), not_space).base();
+    return std::string(begin, end);
+}
+
+/// Parse a comma-separated "venue:fee_bps" string into a map.
+/// Example: "binance:10,okx:8,bybit:10"  →  {{"binance",10},{"okx",8},{"bybit",10}}
+/// Malformed or unsafe tokens are skipped with a warning.
+inline std::unordered_map<std::string, double> parse_venue_fees(const std::string &s) {
+    std::unordered_map<std::string, double> result;
+    if (s.empty()) return result;
+    std::istringstream ss(s);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        const auto colon = token.find(':');
+        if (colon == std::string::npos || colon == 0 || colon + 1 == token.size()) {
+            spdlog::warn("[brain] venue-fees: malformed token '{}' skipped", token);
+            continue;
+        }
+        const std::string venue = trim_ascii_whitespace(token.substr(0, colon));
+        const std::string fee_text = trim_ascii_whitespace(token.substr(colon + 1));
+        if (venue.empty() || fee_text.empty()) {
+            spdlog::warn("[brain] venue-fees: malformed token '{}' skipped", token);
+            continue;
+        }
+        try {
+            const double fee = std::stod(fee_text);
+            if (fee < 0.0) {
+                spdlog::warn("[brain] venue-fees: negative fee ignored for '{}'", venue);
+                continue;
+            }
+            if (fee > 1000.0) {
+                spdlog::warn("[brain] venue-fees: suspiciously large fee {:.1f}bps for '{}' — accepted but verify",
+                             fee, venue);
+            }
+            result[venue] = fee;
+        } catch (...) {
+            spdlog::warn("[brain] venue-fees: malformed token '{}' skipped", token);
+        }
+    }
+    return result;
+}
 
 struct BrainOptions {
     std::string bind{"0.0.0.0"};
@@ -27,6 +79,9 @@ struct BrainOptions {
     uint16_t    health_port{0};   ///< D5: plain-HTTP health endpoint port (0 = disabled)
     bool        standby{false};   ///< F4: start in passive standby mode (no signal emission)
     uint16_t signal_port{0};  ///< ES2: outbound exec signal port (0 = disabled)
+    /// Per-venue taker fee in bps, parsed from --venue-fees.
+    /// Used by ArbDetector to compute fee-adjusted net spread.
+    std::unordered_map<std::string, double> venue_fee_bps;
     bool        show_help{false};
 };
 
@@ -74,7 +129,11 @@ inline bool parse_brain_cmdline(int argc, char **argv, BrainOptions &out) {
                           "F4: start in passive standby mode — receives data but emits no signals; "
                           "promote to active with SIGUSR1")
         ("signal-port",   po::value<uint16_t>()->default_value(0),
-                          "ES2: outbound WebSocket port for exec signal push (0 = disabled)");
+                          "ES2: outbound WebSocket port for exec signal push (0 = disabled)")
+        ("venue-fees",    po::value<std::string>()->default_value(""),
+                          "Per-venue taker fee in bps, comma-separated venue:fee pairs "
+                          "(e.g. binance:10,okx:8,bybit:10); used to compute fee-adjusted "
+                          "net spread — min-spread-bps is applied to net spread");
 
     po::variables_map vm;
     try {
@@ -118,6 +177,7 @@ inline bool parse_brain_cmdline(int argc, char **argv, BrainOptions &out) {
     out.health_port = vm["health-port"].as<uint16_t>();
     out.standby     = vm["standby"].as<bool>();
     out.signal_port = vm["signal-port"].as<uint16_t>();
+    out.venue_fee_bps = parse_venue_fees(vm["venue-fees"].as<std::string>());
     if (vm.count("certfile"))   out.certfile   = vm["certfile"].as<std::string>();
     if (vm.count("keyfile"))    out.keyfile    = vm["keyfile"].as<std::string>();
     if (vm.count("ca-certfile")) out.ca_certfile = vm["ca-certfile"].as<std::string>();
@@ -126,6 +186,10 @@ inline bool parse_brain_cmdline(int argc, char **argv, BrainOptions &out) {
     if (out.certfile.empty() || out.keyfile.empty()) {
         std::cerr << "[brain] --certfile and --keyfile are required\n";
         return false;
+    }
+    if (out.max_spread_bps > 0.0 && out.min_spread_bps > out.max_spread_bps) {
+        spdlog::warn("[brain] min-spread-bps ({}) > max-spread-bps ({}) — no crosses will emit",
+                     out.min_spread_bps, out.max_spread_bps);
     }
 
     return true;

@@ -1,3 +1,5 @@
+#include <memory>
+
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/signal_set.hpp>
@@ -10,6 +12,7 @@
 #include "connection_handler/WsClient.hpp"
 #include "utils/Log.hpp"
 
+#include "exec/DryRunOrderClient.hpp"
 #include "exec/DeadlineOrderTracker.hpp"
 #include "exec/ExecCmdLine.hpp"
 #include "exec/ExecEngine.hpp"
@@ -57,7 +60,15 @@ int main(int argc, char **argv)
     auto strand = boost::asio::make_strand(ioc);
 
     // ---- Component assembly ----
-    exec::StubOrderClient client(strand);
+    std::unique_ptr<exec::IOrderClient> client;
+    // The order client is the final safety boundary before venue traffic.
+    // Default startup uses DryRunOrderClient; live mode must first pass the
+    // rollout guards in parse_exec_cmdline().
+    if (opts.dry_run) {
+        client = std::make_unique<exec::DryRunOrderClient>(strand);
+    } else {
+        client = std::make_unique<exec::StubOrderClient>(strand);
+    }
 
     // EX5: per-order deadline timer. on_timeout fires on the exec strand.
     // ExecEngine is not yet reachable from the lambda (constructed below),
@@ -71,20 +82,27 @@ int main(int argc, char **argv)
         });
 
     // EX3: ImmediateStrategy — submits one order per ArbCross leg.
+    // EX4: ExecEngine — enforces E1–E4 guards then dispatches to strategy.
+    exec::ExecEngine *engine_ptr = nullptr;
     auto strategy = std::make_unique<exec::ImmediateStrategy>(
         opts.venue,
-        client,
+        *client,
         *tracker,
+        // Confirmed fills update both E5 (tracker timeout state) and E1
+        // (ExecEngine open_notional_). Without this callback, the position
+        // limit would only work in isolated unit tests, not live flow.
+        [&engine_ptr](const exec::Fill &fill) {
+            if (engine_ptr) engine_ptr->on_fill(fill);
+        },
         strand,
         opts.target_qty);
-
-    // EX4: ExecEngine — enforces E1–E4 guards then dispatches to strategy.
     exec::ExecEngine engine(
         opts.venue,
         std::move(strategy),
         opts.position_limit,
         opts.max_order_notional,
         opts.cooldown_ms * 1'000'000LL); // ms → ns
+    engine_ptr = &engine;
 
     // ---- WsClient: inbound signal stream from brain's SignalServer ----
     auto ws = md::WsClient::create(ioc);
@@ -138,11 +156,14 @@ int main(int argc, char **argv)
 
     spdlog::info("[exec] starting venue={} brain={}:{} "
                  "target_qty={} position_limit={} max_order_notional={} "
-                 "cooldown_ms={} confirmation_timeout_ms={}",
+                 "cooldown_ms={} confirmation_timeout_ms={} dry_run={} arm_live={} "
+                 "enable_live_venue={} live_order_notional_cap={}",
                  opts.venue, opts.brain_host, opts.brain_port,
                  opts.target_qty, opts.position_limit,
                  opts.max_order_notional, opts.cooldown_ms,
-                 opts.confirmation_timeout_ms);
+                 opts.confirmation_timeout_ms, opts.dry_run,
+                 opts.arm_live, opts.enable_live_venue,
+                 opts.live_order_notional_cap);
 
     ioc.run();
     return 0;
